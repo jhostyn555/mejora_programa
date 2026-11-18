@@ -24,6 +24,9 @@ import 'package:trufi_core_transport_list/trufi_core_transport_list.dart';
 import 'package:trufi_core_ui/trufi_core_ui.dart';
 import 'package:trufi_core_utils/trufi_core_utils.dart' show OverlayManager;
 
+import 'auth/account_screen.dart';
+import 'auth/person_button.dart';
+import 'auth/supabase_config.dart';
 import 'l10n/app_localizations.dart';
 
 // ============ CONFIGURATION ============
@@ -307,7 +310,10 @@ final FaresConfig cochabambaFaresConfig = FaresConfig(
 );
 // ========================================
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initializeSupabase();
+
   runTrufiApp(
     AppConfiguration(
       appName: _appName,
@@ -349,6 +355,8 @@ void main() {
           label: 'WhatsApp',
         ),
       ],
+      // Botones de acceso en el pie del menu lateral de la vista de usuario.
+      drawerFooterExtra: const AuthDrawerFooter(),
       overlayManager: OverlayManager(
         managers: [
           OnboardingManager(
@@ -456,6 +464,8 @@ void main() {
         FaresTrufiScreen(config: cochabambaFaresConfig),
         FeedbackTrufiScreen(config: FeedbackConfig(feedbackUrl: _feedbackUrl)),
         SettingsTrufiScreen(),
+        // Cuenta: inicio de sesion, roles y acceso al panel administrativo.
+        AccountTrufiScreen(),
         AboutTrufiScreen(
           config: AboutScreenConfig(
             appName: _appName,

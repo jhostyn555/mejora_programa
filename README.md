@@ -97,6 +97,27 @@ assets/
 - Instagram: https://www.instagram.com/trufi.app
 - WhatsApp: https://wa.me/59167835296
 
+### Acceso (Supabase)
+
+El menu lateral (pie) tiene **Iniciar sesión** y **Crear cuenta**, y ademas esta la pantalla **Mi cuenta**. Para habilitarlos, pasa las credenciales al ejecutar:
+
+```powershell
+# Una sola linea: funciona en PowerShell, CMD, Bash, macOS y Linux
+flutter run -d chrome --dart-define=SUPABASE_URL=https://TU_PROYECTO.supabase.co --dart-define=SUPABASE_ANON_KEY=TU_PUBLISHABLE_KEY
+```
+
+En PowerShell tambien puedes partirlo con acento grave (`), no con `\`:
+
+```powershell
+flutter run -d chrome `
+  --dart-define=SUPABASE_URL=https://TU_PROYECTO.supabase.co `
+  --dart-define=SUPABASE_ANON_KEY=TU_PUBLISHABLE_KEY
+```
+
+Si no tienes Chrome instalado, usa `flutter run -d web-server --web-port 8080` y abre `http://localhost:8080`.
+
+Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque. Antes de usar roles, ejecuta [`supabase/schema.sql`](supabase/schema.sql) en el SQL Editor; ahi se crean los perfiles, las politicas y el primer administrador. Una cuenta con rol `admin` ve dos paneles en **Mi cuenta**: el de cliente y un boton **Entrar al panel admin**.
+
 ## 🚀 Desarrollo
 
 ### Requisitos

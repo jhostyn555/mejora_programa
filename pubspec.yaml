@@ -103,6 +103,7 @@ dependencies:
       path: packages/trufi_core_poi_layers
   latlong2: ^0.9.1
   maplibre_gl: ^0.26.2
+  supabase_flutter: ^2.18.3
 
 dev_dependencies:
   flutter_test:

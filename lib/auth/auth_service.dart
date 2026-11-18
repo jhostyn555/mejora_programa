@@ -1,0 +1,138 @@
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import 'supabase_config.dart';
+
+enum AppRole { cliente, transportista, control, admin }
+
+AppRole roleFromString(String? value) => AppRole.values.firstWhere(
+      (r) => r.name == value,
+      orElse: () => AppRole.cliente,
+    );
+
+class Profile {
+  final String id;
+  final String fullName;
+  final AppRole role;
+  final AppRole? requestedRole;
+
+  const Profile({
+    required this.id,
+    required this.fullName,
+    required this.role,
+    this.requestedRole,
+  });
+
+  factory Profile.fromMap(Map<String, dynamic> map) => Profile(
+        id: map['id'] as String,
+        fullName: (map['full_name'] ?? '') as String,
+        role: roleFromString(map['role'] as String?),
+        requestedRole: map['requested_role'] == null
+            ? null
+            : roleFromString(map['requested_role'] as String?),
+      );
+}
+
+class AuthService {
+  SupabaseClient get _client => Supabase.instance.client;
+
+  /// False cuando la app se ejecuto sin las credenciales de Supabase.
+  bool get isConfigured => isSupabaseConfigured;
+
+  bool get isSignedIn => isConfigured && _client.auth.currentSession != null;
+
+  /// Stream seguro: es null si Supabase no fue inicializado, asi los widgets
+  /// no intentan leer `Supabase.instance.client` en una app sin configurar.
+  Stream<AuthState>? get authChanges =>
+      isConfigured ? _client.auth.onAuthStateChange : null;
+
+  User? get currentUser => isConfigured ? _client.auth.currentUser : null;
+
+  void _requireConfig() {
+    if (!isConfigured) throw StateError(supabaseMissingConfigMessage);
+  }
+
+  Future<void> signIn(String email, String password) async {
+    _requireConfig();
+    await _client.auth.signInWithPassword(email: email, password: password);
+  }
+
+  Future<void> signUp({
+    required String email,
+    required String password,
+    required String fullName,
+  }) async {
+    _requireConfig();
+    await _client.auth.signUp(
+      email: email,
+      password: password,
+      data: {'full_name': fullName},
+    );
+  }
+
+  Future<void> signOut() async {
+    if (!isConfigured) return;
+    await _client.auth.signOut();
+  }
+
+  /// Lee el perfil del usuario. Si el trigger de `schema.sql` no creo la fila
+  /// (cuentas anteriores al trigger), se crea con `ensure_profile` y, si ese
+  /// RPC aun no existe, se devuelve un perfil de cliente de emergencia para
+  /// que el panel no muestre un error despues de iniciar sesion.
+  Future<Profile?> fetchProfile() async {
+    _requireConfig();
+    final uid = currentUser?.id;
+    if (uid == null) return null;
+
+    Map<String, dynamic>? row;
+    try {
+      row = await _client
+          .from('profiles')
+          .select()
+          .eq('id', uid)
+          .maybeSingle();
+      if (row == null) {
+        final created = await _client.rpc('ensure_profile');
+        if (created is Map) row = Map<String, dynamic>.from(created);
+      }
+    } catch (_) {
+      // Perfil ausente o RPC no aplicado: se usa el fallback de abajo.
+    }
+
+    if (row != null) return Profile.fromMap(row);
+
+    return Profile(
+      id: uid,
+      fullName: (currentUser?.userMetadata?['full_name'] ?? '') as String,
+      role: AppRole.cliente,
+    );
+  }
+
+  /// El usuario pide ser transportista o control. Su rol no cambia hasta que
+  /// un administrador lo apruebe.
+  Future<void> requestRole(AppRole role) async {
+    _requireConfig();
+    await _client
+        .from('profiles')
+        .update({'requested_role': role.name})
+        .eq('id', currentUser!.id);
+  }
+
+  Future<List<Profile>> pendingRequests() async {
+    _requireConfig();
+    final rows = await _client
+        .from('profiles')
+        .select()
+        .not('requested_role', 'is', null);
+    return (rows as List)
+        .map((r) => Profile.fromMap(Map<String, dynamic>.from(r as Map)))
+        .toList();
+  }
+
+  Future<void> decideRequest(String userId, {required bool approve}) async {
+    _requireConfig();
+    await _client.rpc(
+      'decide_request',
+      params: {'target': userId, 'approve': approve},
+    );
+  }
+}
