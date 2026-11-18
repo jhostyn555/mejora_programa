@@ -116,7 +116,19 @@ flutter run -d chrome `
 
 Si no tienes Chrome instalado, usa `flutter run -d web-server --web-port 8080` y abre `http://localhost:8080`.
 
-Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque. Antes de usar roles, ejecuta [`supabase/schema.sql`](supabase/schema.sql) en el SQL Editor; ahi se crean los perfiles, las politicas y el primer administrador. Una cuenta con rol `admin` ve dos paneles en **Mi cuenta**: el de cliente y un boton **Entrar al panel admin**.
+Para pruebas locales, desactiva **Authentication → Sign In / Providers → Email → Confirm email** en Supabase. Si no, el plan gratuito agota el cupo de correos por hora y aparece `email rate limit exceeded` al registrar cuentas (la app ya muestra un mensaje explicativo). En produccion vuelve a activarlo.
+
+Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque. Antes de usar roles, ejecuta [`supabase/schema.sql`](supabase/schema.sql) en el SQL Editor. Si ya tenias una base anterior, la forma mas simple es pegar [`supabase/apply_migrations.sql`](supabase/apply_migrations.sql) (incluye todo y es seguro repetirlo); por separado son [`supabase/roles_control_migration.sql`](supabase/roles_control_migration.sql) y [`supabase/admin_roles_options_migration.sql`](supabase/admin_roles_options_migration.sql). Ahi se crean los perfiles, las politicas y el primer administrador.
+
+**Roles y altas:**
+
+- **Cliente**: al registrarse; puede pedir **transportista** o **control** desde **Mi cuenta**.
+- **Transportista**: se obtiene por solicitud aprobada por admin o control. Su panel esta vacio por ahora.
+- **Control**: el admin lo crea desde **Panel administrativo → Clientes**, buscando el correo del cliente y pulsando **Hacer control**. El control gestiona las solicitudes de rol en su propia vista.
+- **Admin**: ve dos paneles en **Mi cuenta**: el de cliente y un boton **Entrar al panel admin**. El panel tiene tres pestañas:
+  - **Solicitudes**: aprobar/rechazar roles pedidos por clientes.
+  - **Roles**: buscar cualquier usuario (no admin) y asignarle **cliente**, **transportista** o **control**. Cada rol abre su propia vista; **admin no se puede asignar desde la app**.
+  - **Herramientas**: opciones en construccion (Dashboard, Lineas, Rutas, Transportistas, Reportes, Notificaciones, Tarifas, Configuracion) listas para implementar despues.
 
 ## 🚀 Desarrollo
 

@@ -32,6 +32,34 @@ class Profile {
       );
 }
 
+/// Cuenta de cliente que el administrador puede transformar en control.
+class ClientAccount {
+  final String id;
+  final String fullName;
+  final String email;
+
+  const ClientAccount({
+    required this.id,
+    required this.fullName,
+    required this.email,
+  });
+}
+
+/// Usuario del panel de roles (nunca administrador).
+class ManagedUser {
+  final String id;
+  final String fullName;
+  final String email;
+  final AppRole role;
+
+  const ManagedUser({
+    required this.id,
+    required this.fullName,
+    required this.email,
+    required this.role,
+  });
+}
+
 class AuthService {
   SupabaseClient get _client => Supabase.instance.client;
 
@@ -133,6 +161,55 @@ class AuthService {
     await _client.rpc(
       'decide_request',
       params: {'target': userId, 'approve': approve},
+    );
+  }
+
+  /// Clientes existentes que el admin puede promover a control.
+  Future<List<ClientAccount>> listClients() async {
+    _requireConfig();
+    final rows = await _client.rpc('list_clients');
+    return (rows as List)
+        .map(
+          (r) => ClientAccount(
+            id: r['id'] as String,
+            fullName: (r['full_name'] ?? '') as String,
+            email: (r['email'] ?? '') as String,
+          ),
+        )
+        .toList();
+  }
+
+  /// Transforma una cuenta de cliente en control (solo admin en el backend).
+  Future<void> promoteToControl(String userId) async {
+    _requireConfig();
+    await _client.rpc(
+      'promote_to_control',
+      params: {'target': userId},
+    );
+  }
+
+  /// Usuarios no administradores del panel de roles.
+  Future<List<ManagedUser>> listUsers() async {
+    _requireConfig();
+    final rows = await _client.rpc('list_users');
+    return (rows as List)
+        .map(
+          (r) => ManagedUser(
+            id: r['id'] as String,
+            fullName: (r['full_name'] ?? '') as String,
+            email: (r['email'] ?? '') as String,
+            role: roleFromString(r['role'] as String?),
+          ),
+        )
+        .toList();
+  }
+
+  /// Asigna cliente/transportista/control. El backend rechaza 'admin'.
+  Future<void> adminSetRole(String userId, AppRole role) async {
+    _requireConfig();
+    await _client.rpc(
+      'admin_set_role',
+      params: {'target': userId, 'new_role': role.name},
     );
   }
 }

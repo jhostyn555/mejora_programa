@@ -44,6 +44,28 @@ class _LoginDialogState extends State<LoginDialog> {
     super.dispose();
   }
 
+  /// Traduce los errores mas comunes de Supabase Auth para que no aparezca
+  /// el mensaje crudo en ingles durante las pruebas.
+  String _friendlyAuthError(String message) {
+    final lower = message.toLowerCase();
+    if (lower.contains('rate limit')) {
+      return 'Supabase agotó el cupo de correos por hora. Para probar, '
+          'desactiva "Confirm email" en Authentication > Sign In / Providers '
+          '> Email, o espera una hora.';
+    }
+    if (lower.contains('already registered') || lower.contains('exists')) {
+      return 'Ese correo ya está registrado. Usa "Ya tengo cuenta".';
+    }
+    if (lower.contains('not confirmed')) {
+      return 'Tu correo aún no está confirmado. Confírmalo o desactiva '
+          '"Confirm email" en Supabase para pruebas.';
+    }
+    if (lower.contains('invalid login credentials')) {
+      return 'Correo o contraseña incorrectos.';
+    }
+    return message;
+  }
+
   String? _validate() {
     if (_registering && _name.text.trim().isEmpty) {
       return 'Escribe tu nombre.';
@@ -93,7 +115,7 @@ class _LoginDialogState extends State<LoginDialog> {
       }
       if (mounted) Navigator.of(context).pop(true);
     } on AuthException catch (e) {
-      if (mounted) setState(() => _error = e.message);
+      if (mounted) setState(() => _error = _friendlyAuthError(e.message));
     } catch (e) {
       if (mounted) setState(() => _error = 'No se pudo iniciar sesion: $e');
     } finally {
