@@ -5,7 +5,9 @@ import 'auth/supabase_config.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await initializeSupabase();
+  try {
+    await initializeSupabase();
+  } catch (_) {}
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
     home: AuthGate(),

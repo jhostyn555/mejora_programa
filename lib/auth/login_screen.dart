@@ -152,7 +152,13 @@ class _LoginDialogState extends State<LoginDialog> {
                     ),
                   ],
                 ),
-                if (!isSupabaseConfigured) ...[
+                if (supabaseInitWarning != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    supabaseInitWarning!,
+                    style: TextStyle(color: theme.colorScheme.error),
+                  ),
+                ] else if (!isSupabaseConfigured) ...[
                   const SizedBox(height: 8),
                   Text(
                     supabaseMissingConfigMessage,

@@ -1,0 +1,2711 @@
+From cc42280316f9b33195980603a1c357fb254a3b6b Mon Sep 17 00:00:00 2001
+From: "Z.ai Assistant" <assistant@z.ai>
+Date: Wed, 18 Nov 2026 21:37:26 +0000
+Subject: [PATCH] feat: roles chofer/control/cliente + Supabase migration
+
+- Renombra AppRole.transportista -> chofer (con compat hacia atras)
+- ClienteView simplificada: solo perfil + avisos, sin opciones de panel
+- ChoferView funcional: vehiculo asignado, iniciar/finalizar viaje, historial, multas, actualizar ubicacion
+- ControlView con 5 pestaas: Solicitudes, Lineas, Vehiculos en vivo, Choferes, Multas
+- Nuevo TransitService (lib/services/transit_service.dart) conecta con las 14 tablas de transporte
+- supabase_config.dart detecta service_role key y bloquea inicializacion
+- Migracion chofer_control_migration.sql: GRANTs en 14 tablas, RLS por tabla, 6 RPC nuevos, trigger on_auth_user_created_full, indices
+- seed_demo_users.sql: 4 usuarios demo (admin/control/chofer/cliente) + linea + vehiculo
+- README actualizado con nuevo sistema de roles y advertencia service_role vs publishable key
+---
+ README.md                             |   58 +-
+ lib/auth/auth_gate.dart               |   17 +
+ lib/auth/auth_service.dart            |   67 +-
+ lib/auth/login_screen.dart            |    8 +-
+ lib/auth/person_button.dart           |   10 +-
+ lib/auth/role_home.dart               |    2 +-
+ lib/auth/supabase_config.dart         |   46 +-
+ lib/auth/views.dart                   | 1060 ++++++++++++++++++++++---
+ lib/main.dart                         |    9 +-
+ lib/main_auth_test.dart               |    4 +-
+ lib/services/transit_service.dart     |  396 +++++++++
+ supabase/chofer_control_migration.sql |  576 ++++++++++++++
+ supabase/seed_demo_users.sql          |  161 ++++
+ 13 files changed, 2271 insertions(+), 143 deletions(-)
+ create mode 100644 lib/services/transit_service.dart
+ create mode 100644 supabase/chofer_control_migration.sql
+ create mode 100644 supabase/seed_demo_users.sql
+
+diff --git a/README.md b/README.md
+index 6a006bc..413ccb2 100644
+--- a/README.md
++++ b/README.md
+@@ -118,17 +118,57 @@ Si no tienes Chrome instalado, usa `flutter run -d web-server --web-port 8080` y
+ 
+ Para pruebas locales, desactiva **Authentication → Sign In / Providers → Email → Confirm email** en Supabase. Si no, el plan gratuito agota el cupo de correos por hora y aparece `email rate limit exceeded` al registrar cuentas (la app ya muestra un mensaje explicativo). En produccion vuelve a activarlo.
+ 
+-Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque. Antes de usar roles, ejecuta [`supabase/schema.sql`](supabase/schema.sql) en el SQL Editor. Si ya tenias una base anterior, la forma mas simple es pegar [`supabase/apply_migrations.sql`](supabase/apply_migrations.sql) (incluye todo y es seguro repetirlo); por separado son [`supabase/roles_control_migration.sql`](supabase/roles_control_migration.sql) y [`supabase/admin_roles_options_migration.sql`](supabase/admin_roles_options_migration.sql). Ahi se crean los perfiles, las politicas y el primer administrador.
++Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque.
+ 
+-**Roles y altas:**
++> **⚠️ IMPORTANTE — service_role key vs publishable key**
++> La `SUPABASE_ANON_KEY` debe ser la **publishable / anon key** (`sb_publishable_...` o un JWT `eyJ...`), **NUNCA** la service_role key (`sb_secret_...`). La service_role es privada y salta toda la RLS: si la pones en el cliente, cualquiera podría borrar cualquier tabla. Si se detecta, `initializeSupabase()` se niega a inicializar y AuthGate muestra el aviso en "Mi cuenta".
+ 
+-- **Cliente**: al registrarse; puede pedir **transportista** o **control** desde **Mi cuenta**.
+-- **Transportista**: se obtiene por solicitud aprobada por admin o control. Su panel esta vacio por ahora.
+-- **Control**: el admin lo crea desde **Panel administrativo → Clientes**, buscando el correo del cliente y pulsando **Hacer control**. El control gestiona las solicitudes de rol en su propia vista.
+-- **Admin**: ve dos paneles en **Mi cuenta**: el de cliente y un boton **Entrar al panel admin**. El panel tiene tres pestañas:
+-  - **Solicitudes**: aprobar/rechazar roles pedidos por clientes.
+-  - **Roles**: buscar cualquier usuario (no admin) y asignarle **cliente**, **transportista** o **control**. Cada rol abre su propia vista; **admin no se puede asignar desde la app**.
+-  - **Herramientas**: opciones en construccion (Dashboard, Lineas, Rutas, Transportistas, Reportes, Notificaciones, Tarifas, Configuracion) listas para implementar despues.
++### Migración de la base de datos
++
++Antes de usar roles, ejecuta las migraciones en el SQL Editor de Supabase:
++
++1. **Esquema base** (perfiles, trigger on_auth_user_created, políticas de `profiles`): [`supabase/schema.sql`](supabase/schema.sql).
++2. **Roles de control y panel admin** (sólo si ya tenías una base anterior): [`supabase/apply_migrations.sql`](supabase/apply_migrations.sql) — incluye todo y es seguro repetirlo; por separado son [`supabase/roles_control_migration.sql`](supabase/roles_control_migration.sql) y [`supabase/admin_roles_options_migration.sql`](supabase/admin_roles_options_migration.sql).
++3. **Roles chofer + tablas de transporte** (GRANTs, RLS en las 14 tablas, helpers RPC): [`supabase/chofer_control_migration.sql`](supabase/chofer_control_migration.sql). Esta migración:
++   - Añade `chofer` al enum `app_role` y migra `transportista → chofer` en `profiles`.
++   - Hace `GRANT SELECT/INSERT/UPDATE/DELETE` sobre las 14 tablas de transporte a `authenticated` y `anon`.
++   - Crea políticas RLS por tabla: lectura pública de `linea`/`ruta`, self-read de `chofer`/`control`/`persona`, admin/control ven todo.
++   - Crea los helpers `my_persona_id()`, `my_chofer_id()`, `my_control_id()`, `my_role()`.
++   - Crea los RPC `my_assigned_vehicle()`, `my_lines()`, `active_vehicles()`, `upsert_vehicle_location()`, `report_incident()`, `create_aviso()`.
++   - Añade un trigger `on_auth_user_created_full` que al registrar un usuario también crea las filas en `usuario`, `persona` y `cliente` (rol por defecto).
++   - Crea índices en `persona(id_usuario)`, `chofer(id_persona)`, `vehiculo(id_chofer)` para acelerar las consultas por `auth.uid()`.
++
++Tras aplicar la migración, **crea el primer administrador a mano**:
++
++```sql
++update public.profiles set role = 'admin' where id = '<uuid-del-admin>';
++```
++
++### Roles y vistas (después de la migración)
++
++La app usa **cuatro roles** y cada uno abre una vista distinta al pulsar **Mi cuenta** en el menú lateral:
++
++| Rol | Vista principal | "Mi cuenta" |
++|---|---|---|
++| **Cliente** | La app de Trufi (mapa + planificador de rutas) | Perfil + avisos. **Sin opciones de panel.** Puede solicitar rol chofer o control desde un botón discreto. |
++| **Chofer** | La app de Trufi | Panel funcional: vehículo asignado (placa, línea, ubicación), iniciar/finalizar viaje, historial de viajes, multas, botón **Actualizar ubicación**. |
++| **Control** | La app de Trufi | Panel con 5 pestañas: Solicitudes de rol, Líneas (con detalle de rutas), Vehículos activos en tiempo real, Choferes registrados, Multas (crear y cambiar estado). |
++| **Admin** | La app de Trufi | Perfil + botón **Entrar al panel admin** con 3 pestañas: Solicitudes, Roles (asignar cliente/chofer/control a cualquier usuario), Herramientas. |
++
++**Cómo se asigna cada rol:**
++
++- **Cliente**: rol por defecto al registrarse. El trigger `on_auth_user_created_full` también crea las filas en `usuario`, `persona` y `cliente`.
++- **Chofer**: solicita el rol desde **Mi cuenta → "Solicitar cuenta de chofer"**. Un admin o control lo aprueba desde **Solicitudes**. Una vez aprobado, hay que crear manualmente la fila en `chofer` (con `id_persona` de la persona recién creada) y asignarle un vehículo desde `vehiculo.id_chofer`.
++- **Control**: el admin lo crea desde **Panel administrativo → Roles**, buscando el correo del usuario y cambiando su rol a `control` con el dropdown. También hay que crear la fila en `control` (con `id_persona` e `id_linea`).
++- **Admin**: **no se asigna desde la app**. Sólo se crea manualmente con el SQL de arriba.
++
++### Conexión con las 14 tablas de transporte
++
++Además de `profiles`, la app ahora usa (a través de `lib/services/transit_service.dart`):
++
++`linea`, `ruta`, `vehiculo`, `chofer`, `control`, `cliente`, `persona`, `usuario`, `aviso`, `multa`, `pago`, `historial_vehiculo_viaje`, `historial_chofer_control`, `administrador`.
++
++Estas tablas ya existían en Supabase pero **no tenían GRANTs ni políticas RLS** (sólo `profiles` las tenía). La migración de arriba arregla eso. Sin la migración, cualquier intento de leer `chofer`, `vehiculo`, etc. devuelve `42501 permission denied for table`.
+ 
+ ## 🚀 Desarrollo
+ 
+diff --git a/lib/auth/auth_gate.dart b/lib/auth/auth_gate.dart
+index 8952ff8..91b0630 100644
+--- a/lib/auth/auth_gate.dart
++++ b/lib/auth/auth_gate.dart
+@@ -14,6 +14,23 @@ class AuthGate extends StatelessWidget {
+ 
+   @override
+   Widget build(BuildContext context) {
++    // Si se detectó la service_role key, no inicializamos Supabase y
++    // mostramos el aviso aquí.
++    if (supabaseInitWarning != null) {
++      return Scaffold(
++        appBar: AppBar(title: const Text('Mi cuenta')),
++        body: Center(
++          child: Padding(
++            padding: const EdgeInsets.all(24),
++            child: Text(
++              supabaseInitWarning!,
++              textAlign: TextAlign.center,
++              style: TextStyle(color: Theme.of(context).colorScheme.error),
++            ),
++          ),
++        ),
++      );
++    }
+     final auth = AuthService();
+     return StreamBuilder<AuthState>(
+       stream: auth.authChanges,
+diff --git a/lib/auth/auth_service.dart b/lib/auth/auth_service.dart
+index 35f6c4a..b52af36 100644
+--- a/lib/auth/auth_service.dart
++++ b/lib/auth/auth_service.dart
+@@ -2,12 +2,42 @@ import 'package:supabase_flutter/supabase_flutter.dart';
+ 
+ import 'supabase_config.dart';
+ 
+-enum AppRole { cliente, transportista, control, admin }
++/// Roles de la aplicación.
++///
++/// `chofer` es el rol del conductor (antes llamado `transportista`; el enum
++/// de la base de datos se renombró en `chofer_control_migration.sql`).
++/// `roleFromString` acepta `'transportista'` por compatibilidad con perfiles
++/// que no se hayan migrado todavía.
++enum AppRole { cliente, chofer, control, admin }
+ 
+-AppRole roleFromString(String? value) => AppRole.values.firstWhere(
+-      (r) => r.name == value,
+-      orElse: () => AppRole.cliente,
+-    );
++AppRole roleFromString(String? value) {
++  switch (value) {
++    case 'chofer':
++    case 'transportista': // compatibilidad hacia atrás
++      return AppRole.chofer;
++    case 'control':
++      return AppRole.control;
++    case 'admin':
++      return AppRole.admin;
++    case 'cliente':
++    default:
++      return AppRole.cliente;
++  }
++}
++
++/// Nombre canónico que se guarda en la base de datos.
++String roleToDb(AppRole role) {
++  switch (role) {
++    case AppRole.chofer:
++      return 'chofer';
++    case AppRole.control:
++      return 'control';
++    case AppRole.admin:
++      return 'admin';
++    case AppRole.cliente:
++      return 'cliente';
++  }
++}
+ 
+ class Profile {
+   final String id;
+@@ -63,8 +93,11 @@ class ManagedUser {
+ class AuthService {
+   SupabaseClient get _client => Supabase.instance.client;
+ 
+-  /// False cuando la app se ejecuto sin las credenciales de Supabase.
+-  bool get isConfigured => isSupabaseConfigured;
++  /// True sólo si las credenciales están definidas y `Supabase.initialize`
++  /// terminó OK. Devolver false aquí evita que los widgets intenten leer
++  /// `Supabase.instance.client` (que lanzaría StateError) en una app sin
++  /// configurar o donde la inicialización falló por detectar service_role.
++  bool get isConfigured => isSupabaseInitialized;
+ 
+   bool get isSignedIn => isConfigured && _client.auth.currentSession != null;
+ 
+@@ -76,7 +109,12 @@ class AuthService {
+   User? get currentUser => isConfigured ? _client.auth.currentUser : null;
+ 
+   void _requireConfig() {
+-    if (!isConfigured) throw StateError(supabaseMissingConfigMessage);
++    if (!isConfigured) {
++      // Distingue los dos motivos para que el mensaje ayude a depurar.
++      if (supabaseInitWarning != null) throw StateError(supabaseInitWarning!);
++      if (!isSupabaseConfigured) throw StateError(supabaseMissingConfigMessage);
++      throw StateError('Supabase no fue inicializado.');
++    }
+   }
+ 
+   Future<void> signIn(String email, String password) async {
+@@ -135,13 +173,16 @@ class AuthService {
+     );
+   }
+ 
+-  /// El usuario pide ser transportista o control. Su rol no cambia hasta que
+-  /// un administrador lo apruebe.
++  /// El usuario pide ser chofer o control. Su rol no cambia hasta que
++  /// un administrador o control lo apruebe.
+   Future<void> requestRole(AppRole role) async {
+     _requireConfig();
++    if (role != AppRole.chofer && role != AppRole.control) {
++      throw ArgumentError('Solo se puede solicitar chofer o control');
++    }
+     await _client
+         .from('profiles')
+-        .update({'requested_role': role.name})
++        .update({'requested_role': roleToDb(role)})
+         .eq('id', currentUser!.id);
+   }
+ 
+@@ -204,12 +245,12 @@ class AuthService {
+         .toList();
+   }
+ 
+-  /// Asigna cliente/transportista/control. El backend rechaza 'admin'.
++  /// Asigna cliente/chofer/control. El backend rechaza 'admin'.
+   Future<void> adminSetRole(String userId, AppRole role) async {
+     _requireConfig();
+     await _client.rpc(
+       'admin_set_role',
+-      params: {'target': userId, 'new_role': role.name},
++      params: {'target': userId, 'new_role': roleToDb(role)},
+     );
+   }
+ }
+diff --git a/lib/auth/login_screen.dart b/lib/auth/login_screen.dart
+index c9608f2..f363683 100644
+--- a/lib/auth/login_screen.dart
++++ b/lib/auth/login_screen.dart
+@@ -152,7 +152,13 @@ class _LoginDialogState extends State<LoginDialog> {
+                     ),
+                   ],
+                 ),
+-                if (!isSupabaseConfigured) ...[
++                if (supabaseInitWarning != null) ...[
++                  const SizedBox(height: 8),
++                  Text(
++                    supabaseInitWarning!,
++                    style: TextStyle(color: theme.colorScheme.error),
++                  ),
++                ] else if (!isSupabaseConfigured) ...[
+                   const SizedBox(height: 8),
+                   Text(
+                     supabaseMissingConfigMessage,
+diff --git a/lib/auth/person_button.dart b/lib/auth/person_button.dart
+index 37c1da1..8c8f21f 100644
+--- a/lib/auth/person_button.dart
++++ b/lib/auth/person_button.dart
+@@ -53,7 +53,15 @@ class AuthDrawerFooter extends StatelessWidget {
+           crossAxisAlignment: CrossAxisAlignment.stretch,
+           mainAxisSize: MainAxisSize.min,
+           children: [
+-            if (!isSupabaseConfigured)
++            if (supabaseInitWarning != null)
++              Padding(
++                padding: const EdgeInsets.only(bottom: 8),
++                child: Text(
++                  supabaseInitWarning!,
++                  style: const TextStyle(fontSize: 12, color: Colors.red),
++                ),
++              )
++            else if (!isSupabaseConfigured)
+               const Padding(
+                 padding: EdgeInsets.only(bottom: 8),
+                 child: Text(
+diff --git a/lib/auth/role_home.dart b/lib/auth/role_home.dart
+index de28371..77e576f 100644
+--- a/lib/auth/role_home.dart
++++ b/lib/auth/role_home.dart
+@@ -57,7 +57,7 @@ class _RoleHomeState extends State<RoleHome> {
+           final view = switch (profile.role) {
+             AppRole.cliente || AppRole.admin =>
+               ClienteView(profile: profile, onChanged: _reload),
+-            AppRole.transportista => const TransportistaView(),
++            AppRole.chofer => const ChoferView(),
+             AppRole.control => const ControlView(),
+           };
+ 
+diff --git a/lib/auth/supabase_config.dart b/lib/auth/supabase_config.dart
+index 42b2498..4e5bfb3 100644
+--- a/lib/auth/supabase_config.dart
++++ b/lib/auth/supabase_config.dart
+@@ -1,6 +1,6 @@
+ import 'package:supabase_flutter/supabase_flutter.dart';
+ 
+-/// Credenciales publicas de Supabase. Se inyectan al compilar/ejecutar:
++/// Credenciales públicas de Supabase. Se inyectan al compilar/ejecutar:
+ ///
+ /// flutter run -d chrome \
+ ///   --dart-define=SUPABASE_URL=https://TU_PROYECTO.supabase.co \
+@@ -11,18 +11,58 @@ import 'package:supabase_flutter/supabase_flutter.dart';
+ const supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+ const supabasePublishableKey = String.fromEnvironment('SUPABASE_ANON_KEY');
+ 
++/// True cuando las constantes de compilación están definidas (no vacías).
++/// No garantiza que `Supabase.initialize` se haya llamado — para eso usa
++/// [isSupabaseInitialized] en código que accede a `Supabase.instance.client`.
+ bool get isSupabaseConfigured =>
+     supabaseUrl.isNotEmpty && supabasePublishableKey.isNotEmpty;
+ 
+ const supabaseMissingConfigMessage =
+     'Falta configurar SUPABASE_URL y SUPABASE_ANON_KEY (dart-define).';
+ 
+-/// Inicializa Supabase solo cuando hay credenciales. Evita que la app completa
+-/// se caiga en el arranque si el planificador se usa sin autenticacion.
++/// Flag en tiempo de ejecución: true si `Supabase.initialize` se llamó y
++/// terminó sin errores. Lo pone `initializeSupabase()` abajo.
++bool _isSupabaseInitialized = false;
++bool get isSupabaseInitialized => _isSupabaseInitialized;
++
++/// Detecta si alguien puso por error la service_role key en el cliente.
++/// La service_role key es PRIVADA y salta toda la RLS: usarla en la app
++/// supondría un agujero de seguridad grave.
++bool get _looksLikeSecretKey {
++  if (!isSupabaseConfigured) return false;
++  final k = supabasePublishableKey;
++  // Formato nuevo de Supabase: las service_role keys empiezan con "sb_secret_"
++  // y las publishable/anon keys con "sb_publishable_". Los JWT legacy
++  // (eyJ...) son más difíciles de distinguir sin decodificarlos; el caso más
++  // común es la cadena plana sb_secret_, que es la que el dashboard muestra
++  // como "service_role".
++  return k.startsWith('sb_secret_') || k.contains('service_role');
++}
++
++/// Mensaje que las vistas muestran cuando se detectó la service_role key.
++const _serviceRoleWarning =
++    'Se detectó la service_role key (sb_secret_...) en SUPABASE_ANON_KEY. '
++    'ESA KEY ES PRIVADA: nunca la pongas en el cliente Flutter. Usa la '
++    'publishable/anon key (Project Settings → API → Project API keys → '
++    'anon public). Mientras tanto la app se niega a inicializar Supabase.';
++
++/// Inicializa Supabase solo cuando hay credenciales y NO se detectó la
++/// service_role key. Evita que la app completa se caiga en el arranque si
++/// el planificador se usa sin autenticacion.
+ Future<void> initializeSupabase() async {
+   if (!isSupabaseConfigured) return;
++  if (_looksLikeSecretKey) {
++    // Fallar a propósito con un mensaje claro en vez de exponer el agujero.
++    throw StateError(_serviceRoleWarning);
++  }
+   await Supabase.initialize(
+     url: supabaseUrl,
+     publishableKey: supabasePublishableKey,
+   );
++  _isSupabaseInitialized = true;
+ }
++
++/// Para que AuthGate / LoggedOutPage puedan mostrar el aviso cuando la
++/// inicialización se negó por usar service_role.
++String? get supabaseInitWarning =>
++    _looksLikeSecretKey ? _serviceRoleWarning : null;
+diff --git a/lib/auth/views.dart b/lib/auth/views.dart
+index 3b8e193..e1003a0 100644
+--- a/lib/auth/views.dart
++++ b/lib/auth/views.dart
+@@ -1,138 +1,1000 @@
+ import 'package:flutter/material.dart';
+ 
++import '../services/transit_service.dart';
+ import 'auth_service.dart';
+ 
+ String _roleLabel(AppRole role) => switch (role) {
+       AppRole.cliente => 'Cliente',
+-      AppRole.transportista => 'Transportista',
++      AppRole.chofer => 'Chofer',
+       AppRole.control => 'Control de líneas',
+       AppRole.admin => 'Administrador',
+     };
+ 
+-/// Menu del cliente. Si la cuenta es administradora, muestra dos paneles:
+-/// el panel de cliente y un panel con el boton para entrar al panel admin.
+-class ClienteView extends StatelessWidget {
++/// ---------------------------------------------------------------------------
++/// CLIENTE
++///   Vista principal = la app de Trufi (mapa + planificador) que ya es la
++///   home de runTrufiApp. Aquí sólo va la cuenta del cliente: perfil y
++///   avisos. NO se muestran botones de panel ni de admin, como pediste.
++/// ---------------------------------------------------------------------------
++class ClienteView extends StatefulWidget {
+   final Profile profile;
+   final VoidCallback onChanged;
+ 
+   const ClienteView({super.key, required this.profile, required this.onChanged});
+ 
+-  Future<void> _request(BuildContext context, AppRole role) async {
++  @override
++  State<ClienteView> createState() => _ClienteViewState();
++}
++
++class _ClienteViewState extends State<ClienteView> {
++  final _transit = TransitService();
++  late Future<List<Map<String, dynamic>>> _avisos =
++      _transit.myAvisosAsCliente();
++
++  void _reload() => setState(() {
++        _avisos = _transit.myAvisosAsCliente();
++      });
++
++  @override
++  Widget build(BuildContext context) {
++    final theme = Theme.of(context);
++    final name = widget.profile.fullName.isEmpty
++        ? ''
++        : ', ${widget.profile.fullName}';
++    final isAdmin = widget.profile.role == AppRole.admin;
++    return ListView(
++      padding: const EdgeInsets.all(24),
++      children: [
++        Card(
++          child: Padding(
++            padding: const EdgeInsets.all(16),
++            child: Column(
++              crossAxisAlignment: CrossAxisAlignment.stretch,
++              children: [
++                Row(
++                  children: [
++                    Icon(Icons.person_outline, color: theme.colorScheme.primary),
++                    const SizedBox(width: 8),
++                    Text('Mi cuenta',
++                        style: theme.textTheme.titleMedium),
++                  ],
++                ),
++                const SizedBox(height: 12),
++                Text('Hola$name',
++                    style: theme.textTheme.titleLarge),
++                const SizedBox(height: 4),
++                Text('Rol: ${_roleLabel(widget.profile.role)}'),
++                const SizedBox(height: 4),
++                Text(
++                  isAdmin
++                      ? 'Tienes acceso al panel administrativo.'
++                      : 'Esta es tu vista de cliente. Usa el mapa y el '
++                          'planificador de rutas desde la pantalla principal.',
++                  style: theme.textTheme.bodySmall,
++                ),
++                if (isAdmin) ...[
++                  const SizedBox(height: 12),
++                  FilledButton.icon(
++                    icon: const Icon(Icons.admin_panel_settings),
++                    label: const Text('Entrar al panel admin'),
++                    onPressed: () => Navigator.of(context).push(
++                      MaterialPageRoute(builder: (_) => const AdminScreen()),
++                    ),
++                  ),
++                ],
++              ],
++            ),
++          ),
++        ),
++        const SizedBox(height: 16),
++        Text('Avisos para ti', style: theme.textTheme.titleMedium),
++        const SizedBox(height: 8),
++        FutureBuilder<List<Map<String, dynamic>>>(
++          future: _avisos,
++          builder: (context, snap) {
++            if (snap.connectionState != ConnectionState.done) {
++              return const Center(
++                heightFactor: 4,
++                child: CircularProgressIndicator(strokeWidth: 2),
++              );
++            }
++            if (snap.hasError) {
++              return Card(
++                child: ListTile(
++                  leading: const Icon(Icons.error_outline),
++                  title: const Text('No se pudieron cargar avisos'),
++                  subtitle: Text('${snap.error}'),
++                ),
++              );
++            }
++            final list = snap.data ?? [];
++            if (list.isEmpty) {
++              return const Padding(
++                padding: EdgeInsets.symmetric(vertical: 24),
++                child: Center(
++                  child: Text('No tienes avisos.',
++                      style: TextStyle(color: Colors.grey)),
++                ),
++              );
++            }
++            return Column(
++              children: [
++                for (final a in list)
++                  Card(
++                    child: ListTile(
++                      leading: const Icon(Icons.campaign_outlined),
++                      title: Text((a['mensaje'] ?? '') as String),
++                      subtitle: Text(_fmtDate(a['fecha_hora'])),
++                    ),
++                  ),
++              ],
++            );
++          },
++        ),
++        const SizedBox(height: 24),
++        if (widget.profile.role == AppRole.cliente)
++          Card(
++            color: theme.colorScheme.surfaceContainerHighest,
++            child: Padding(
++              padding: const EdgeInsets.all(16),
++              child: Column(
++                crossAxisAlignment: CrossAxisAlignment.stretch,
++                children: [
++                  Text('¿Eres chofer o control?',
++                      style: theme.textTheme.titleSmall),
++                  const SizedBox(height: 8),
++                  OutlinedButton.icon(
++                    icon: const Icon(Icons.directions_bus),
++                    label: const Text('Solicitar cuenta de chofer'),
++                    onPressed: () => _requestRole(AppRole.chofer),
++                  ),
++                  const SizedBox(height: 8),
++                  OutlinedButton.icon(
++                    icon: const Icon(Icons.admin_panel_settings_outlined),
++                    label: const Text('Solicitar acceso de control'),
++                    onPressed: () => _requestRole(AppRole.control),
++                  ),
++                ],
++              ),
++            ),
++          ),
++      ],
++    );
++  }
++
++  Future<void> _requestRole(AppRole role) async {
+     try {
+       await AuthService().requestRole(role);
+-      if (!context.mounted) return;
++      if (!mounted) return;
+       ScaffoldMessenger.of(context).showSnackBar(
+         const SnackBar(
+           content: Text('Solicitud enviada. Un administrador la revisará.'),
+         ),
+       );
+-      onChanged();
++      widget.onChanged();
+     } catch (e) {
+-      if (!context.mounted) return;
++      if (!mounted) return;
+       ScaffoldMessenger.of(context).showSnackBar(
+         SnackBar(content: Text('No se pudo enviar la solicitud: $e')),
+       );
+     }
+   }
+ 
+-  Widget _panel({
+-    required BuildContext context,
+-    required String title,
+-    required IconData icon,
+-    required List<Widget> children,
+-  }) {
+-    return Card(
+-      clipBehavior: Clip.antiAlias,
+-      child: Padding(
+-        padding: const EdgeInsets.all(16),
+-        child: Column(
+-          crossAxisAlignment: CrossAxisAlignment.stretch,
+-          children: [
+-            Row(
++  String _fmtDate(dynamic v) {
++    if (v == null) return '';
++    final s = v.toString();
++    if (s.length >= 16) return s.substring(0, 16).replaceAll('T', ' ');
++    return s;
++  }
++}
++
++/// ---------------------------------------------------------------------------
++/// CHOFER
++///   Panel funcional: vehículo asignado, viaje activo, historial, multas,
++///   actualización de ubicación.
++/// ---------------------------------------------------------------------------
++class ChoferView extends StatefulWidget {
++  const ChoferView({super.key});
++
++  @override
++  State<ChoferView> createState() => _ChoferViewState();
++}
++
++class _ChoferViewState extends State<ChoferView> {
++  final _transit = TransitService();
++  late Future<Map<String, dynamic>?> _vehicle = _transit.myVehicle();
++  late Future<List<Map<String, dynamic>>> _history = _transit.myTripHistory();
++  late Future<List<Map<String, dynamic>>> _fines = _transit.myFines();
++  bool _locating = false;
++  bool _tripBusy = false;
++
++  void _reloadAll() => setState(() {
++        _vehicle = _transit.myVehicle();
++        _history = _transit.myTripHistory();
++        _fines = _transit.myFines();
++      });
++
++  Future<void> _updateLocation() async {
++    setState(() => _locating = true);
++    try {
++      // Sin plugin de geolocalización en este PR: pedimos lat/lng por
++      // defecto al centro de Cochabamba. Cuando se añada geolocator,
++      // reemplazar por Position actual.
++      const lat = -17.3988354;
++      const lng = -66.1626903;
++      await _transit.updateMyLocation(lat, lng);
++      if (!mounted) return;
++      ScaffoldMessenger.of(context).showSnackBar(
++        const SnackBar(content: Text('Ubicación actualizada')),
++      );
++      _reloadAll();
++    } catch (e) {
++      if (!mounted) return;
++      ScaffoldMessenger.of(context).showSnackBar(
++        SnackBar(content: Text('No se pudo actualizar: $e')),
++      );
++    } finally {
++      if (mounted) setState(() => _locating = false);
++    }
++  }
++
++  Future<void> _toggleTrip(Map<String, dynamic>? vehicle) async {
++    if (vehicle == null) return;
++    setState(() => _tripBusy = true);
++    try {
++      final vehId = vehicle['id_vehiculo'] as int;
++      final lineaId = vehicle['id_linea'] as int?;
++      if (lineaId == null) {
++        ScaffoldMessenger.of(context).showSnackBar(
++          const SnackBar(content: Text('Tu vehículo no tiene línea asignada')),
++        );
++        return;
++      }
++      // Buscar la primera ruta de la línea.
++      final rutas = await _transit.listRoutes(idLinea: lineaId);
++      if (rutas.isEmpty) {
++        ScaffoldMessenger.of(context).showSnackBar(
++          const SnackBar(content: Text('La línea no tiene rutas')),
++        );
++        return;
++      }
++      final rutaId = rutas.first['id_ruta'] as int;
++      final history = await _history;
++      final activeTrip = history
++          .where((t) => t['fecha_fin'] == null)
++          .toList();
++      if (activeTrip.isEmpty) {
++        await _transit.startTrip(vehiculoId: vehId, rutaId: rutaId);
++        if (!mounted) return;
++        ScaffoldMessenger.of(context).showSnackBar(
++          const SnackBar(content: Text('Viaje iniciado')),
++        );
++      } else {
++        await _transit.endActiveTrip();
++        if (!mounted) return;
++        ScaffoldMessenger.of(context).showSnackBar(
++          const SnackBar(content: Text('Viaje finalizado')),
++        );
++      }
++      _reloadAll();
++    } catch (e) {
++      if (!mounted) return;
++      ScaffoldMessenger.of(context).showSnackBar(
++        SnackBar(content: Text('Error: $e')),
++      );
++    } finally {
++      if (mounted) setState(() => _tripBusy = false);
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final theme = Theme.of(context);
++    return ListView(
++      padding: const EdgeInsets.all(24),
++      children: [
++        // --- Vehículo asignado ---
++        FutureBuilder<Map<String, dynamic>?>(
++          future: _vehicle,
++          builder: (context, snap) {
++            if (snap.connectionState != ConnectionState.done) {
++              return const Center(
++                heightFactor: 4,
++                child: CircularProgressIndicator(strokeWidth: 2),
++              );
++            }
++            if (snap.hasError) {
++              return Card(
++                child: ListTile(
++                  leading: const Icon(Icons.error_outline),
++                  title: const Text('No se pudo cargar el vehículo'),
++                  subtitle: Text('${snap.error}'),
++                ),
++              );
++            }
++            final v = snap.data;
++            if (v == null) {
++              return Card(
++                child: Padding(
++                  padding: const EdgeInsets.all(16),
++                  child: Column(
++                    crossAxisAlignment: CrossAxisAlignment.stretch,
++                    children: [
++                      Row(
++                        children: [
++                          Icon(Icons.directions_bus,
++                              color: theme.colorScheme.primary),
++                          const SizedBox(width: 8),
++                          Text('Sin vehículo asignado',
++                              style: theme.textTheme.titleMedium),
++                        ],
++                      ),
++                      const SizedBox(height: 8),
++                      const Text(
++                        'Cuando un administrador te asigne un vehículo, '
++                        'lo verás aquí.',
++                        style: TextStyle(color: Colors.grey),
++                      ),
++                    ],
++                  ),
++                ),
++              );
++            }
++            final placa = v['placa'] as String? ?? '—';
++            final linea = v['id_linea'] as int?;
++            final lat = v['latitud'] as double?;
++            final lng = v['longitud'] as double?;
++            final active = v['activo'] as bool? ?? false;
++            return Card(
++              child: Padding(
++                padding: const EdgeInsets.all(16),
++                child: Column(
++                  crossAxisAlignment: CrossAxisAlignment.stretch,
++                  children: [
++                    Row(
++                      children: [
++                        Icon(Icons.directions_bus,
++                            color: theme.colorScheme.primary),
++                        const SizedBox(width: 8),
++                        Text('Vehículo asignado',
++                            style: theme.textTheme.titleMedium),
++                        const Spacer(),
++                        Chip(
++                          label: Text(active ? 'Activo' : 'Inactivo'),
++                          backgroundColor: active
++                              ? Colors.green.shade100
++                              : Colors.grey.shade200,
++                        ),
++                      ],
++                    ),
++                    const SizedBox(height: 12),
++                    _kv('Placa', placa),
++                    if (linea != null) _kv('Línea', '#$linea'),
++                    if (lat != null && lng != null)
++                      _kv('Ubicación', '${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}'),
++                    const SizedBox(height: 12),
++                    Row(
++                      children: [
++                        Expanded(
++                          child: FilledButton.icon(
++                            icon: _locating
++                                ? const SizedBox(
++                                    height: 16,
++                                    width: 16,
++                                    child: CircularProgressIndicator(
++                                        strokeWidth: 2),
++                                  )
++                                : const Icon(Icons.my_location),
++                            label: const Text('Actualizar ubicación'),
++                            onPressed: _locating ? null : _updateLocation,
++                          ),
++                        ),
++                      ],
++                    ),
++                    const SizedBox(height: 8),
++                    FutureBuilder<List<Map<String, dynamic>>>(
++                      future: _history,
++                      builder: (context, h) {
++                        if (h.connectionState != ConnectionState.done) {
++                          return const SizedBox.shrink();
++                        }
++                        final activeTrip = (h.data ?? [])
++                            .where((t) => t['fecha_fin'] == null)
++                            .toList();
++                        final hasActive = activeTrip.isNotEmpty;
++                        return FilledButton.tonalIcon(
++                          icon: hasActive
++                              ? const Icon(Icons.stop_circle_outlined)
++                              : const Icon(Icons.play_arrow),
++                          label: Text(hasActive ? 'Finalizar viaje' : 'Iniciar viaje'),
++                          onPressed: _tripBusy ? null : () => _toggleTrip(v),
++                        );
++                      },
++                    ),
++                  ],
++                ),
++              ),
++            );
++          },
++        ),
++        const SizedBox(height: 16),
++
++        // --- Historial de viajes ---
++        Text('Historial de viajes', style: theme.textTheme.titleMedium),
++        const SizedBox(height: 8),
++        FutureBuilder<List<Map<String, dynamic>>>(
++          future: _history,
++          builder: (context, snap) {
++            if (snap.connectionState != ConnectionState.done) {
++              return const Center(
++                heightFactor: 3,
++                child: CircularProgressIndicator(strokeWidth: 2),
++              );
++            }
++            if (snap.hasError) {
++              return Text('Error: ${snap.error}');
++            }
++            final list = snap.data ?? [];
++            if (list.isEmpty) {
++              return const Padding(
++                padding: EdgeInsets.symmetric(vertical: 16),
++                child: Center(
++                  child: Text('Sin viajes registrados.',
++                      style: TextStyle(color: Colors.grey)),
++                ),
++              );
++            }
++            return Column(
+               children: [
+-                Icon(icon, color: Theme.of(context).colorScheme.primary),
+-                const SizedBox(width: 8),
+-                Text(
+-                  title,
+-                  style: Theme.of(context).textTheme.titleMedium,
++                for (final t in list.take(10))
++                  Card(
++                    child: ListTile(
++                      leading: const Icon(Icons.history),
++                      title: Text(
++                        'Viaje #${t['id_historial_viaje']} • '
++                        'Ruta ${t['id_ruta']}',
++                      ),
++                      subtitle: Text(
++                        'Inicio: ${_fmtDate(t['fecha_inicio'])}\n'
++                        'Fin: ${t['fecha_fin'] == null ? 'En curso' : _fmtDate(t['fecha_fin'])}',
++                      ),
++                      isThreeLine: true,
++                      trailing: t['cantidad_pasajeros'] != null
++                          ? Chip(
++                              label: Text('${t['cantidad_pasajeros']} pax'),
++                            )
++                          : null,
++                    ),
++                  ),
++              ],
++            );
++          },
++        ),
++        const SizedBox(height: 16),
++
++        // --- Multas ---
++        Text('Multas', style: theme.textTheme.titleMedium),
++        const SizedBox(height: 8),
++        FutureBuilder<List<Map<String, dynamic>>>(
++          future: _fines,
++          builder: (context, snap) {
++            if (snap.connectionState != ConnectionState.done) {
++              return const Center(
++                heightFactor: 3,
++                child: CircularProgressIndicator(strokeWidth: 2),
++              );
++            }
++            if (snap.hasError) {
++              return Text('Error: ${snap.error}');
++            }
++            final list = snap.data ?? [];
++            if (list.isEmpty) {
++              return const Padding(
++                padding: EdgeInsets.symmetric(vertical: 16),
++                child: Center(
++                  child: Text('Sin multas. ¡Bien hecho!',
++                      style: TextStyle(color: Colors.grey)),
+                 ),
++              );
++            }
++            return Column(
++              children: [
++                for (final m in list)
++                  Card(
++                    child: ListTile(
++                      leading: const Icon(Icons.gavel),
++                      title: Text(m['motivo'] as String? ?? 'Multa'),
++                      subtitle: Text(
++                        'Monto: ${m['monto']} • ${m['estado']} • '
++                        '${_fmtDate(m['fecha_hora'])}',
++                      ),
++                    ),
++                  ),
+               ],
+-            ),
+-            const SizedBox(height: 16),
+-            ...children,
+-          ],
++            );
++          },
+         ),
++      ],
++    );
++  }
++
++  Widget _kv(String k, String v) {
++    return Padding(
++      padding: const EdgeInsets.symmetric(vertical: 2),
++      child: Row(
++        children: [
++          Text('$k:  ', style: const TextStyle(fontWeight: FontWeight.w600)),
++          Expanded(child: Text(v)),
++        ],
+       ),
+     );
+   }
+ 
++  String _fmtDate(dynamic v) {
++    if (v == null) return '';
++    final s = v.toString();
++    if (s.length >= 16) return s.substring(0, 16).replaceAll('T', ' ');
++    return s;
++  }
++}
++
++/// ---------------------------------------------------------------------------
++/// CONTROL
++///   Pestañas: Solicitudes de rol, Líneas, Vehículos en vivo, Choferes,
++///   Multas, Avisos.
++/// ---------------------------------------------------------------------------
++class ControlView extends StatelessWidget {
++  const ControlView({super.key});
++
+   @override
+   Widget build(BuildContext context) {
+-    final isAdmin = profile.role == AppRole.admin;
+-    final isCliente = profile.role == AppRole.cliente;
+-    final name = profile.fullName.isEmpty ? '' : ', ${profile.fullName}';
+-
+-    final children = <Widget>[
+-      if (isAdmin) ...[
+-        _panel(
+-          context: context,
+-          title: 'Panel de cliente',
+-          icon: Icons.person_outline,
+-          children: [
+-            Text('Hola$name', style: Theme.of(context).textTheme.titleLarge),
+-            const SizedBox(height: 4),
+-            Text('Rol: ${_roleLabel(profile.role)}'),
+-          ],
++    return DefaultTabController(
++      length: 5,
++      child: Column(
++        children: [
++          const Padding(
++            padding: EdgeInsets.fromLTRB(24, 16, 24, 0),
++            child: Align(
++              alignment: Alignment.centerLeft,
++              child: Text(
++                'Panel de control de líneas',
++                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
++              ),
++            ),
++          ),
++          const TabBar(
++            isScrollable: true,
++            tabs: [
++              Tab(icon: Icon(Icons.approval), text: 'Solicitudes'),
++              Tab(icon: Icon(Icons.alt_route), text: 'Líneas'),
++              Tab(icon: Icon(Icons.directions_bus), text: 'Vehículos'),
++              Tab(icon: Icon(Icons.people_alt), text: 'Choferes'),
++              Tab(icon: Icon(Icons.gavel), text: 'Multas'),
++            ],
++          ),
++          const Expanded(
++            child: TabBarView(
++              children: [
++                AdminView(),
++                _ControlLinesTab(),
++                _ControlVehiclesTab(),
++                _ControlChoferesTab(),
++                _ControlFinesTab(),
++              ],
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++}
++
++class _ControlLinesTab extends StatefulWidget {
++  const _ControlLinesTab();
++
++  @override
++  State<_ControlLinesTab> createState() => _ControlLinesTabState();
++}
++
++class _ControlLinesTabState extends State<_ControlLinesTab> {
++  final _transit = TransitService();
++  late Future<List<Map<String, dynamic>>> _lines = _transit.myManagedLines();
++
++  @override
++  Widget build(BuildContext context) {
++    return FutureBuilder<List<Map<String, dynamic>>>(
++      future: _lines,
++      builder: (context, snap) {
++        if (snap.connectionState != ConnectionState.done) {
++          return const Center(child: CircularProgressIndicator());
++        }
++        if (snap.hasError) {
++          return Center(child: Text('Error: ${snap.error}'));
++        }
++        final list = snap.data ?? [];
++        if (list.isEmpty) {
++          return const Center(child: Text('No gestionas ninguna línea'));
++        }
++        return ListView.builder(
++          itemCount: list.length,
++          itemBuilder: (context, i) {
++            final l = list[i];
++            return ListTile(
++              leading: const Icon(Icons.alt_route),
++              title: Text(l['nombre_linea'] as String? ?? 'Línea ${l['id_linea']}'),
++              subtitle: Text(l['descripcion'] as String? ?? ''),
++              trailing: Chip(label: Text(l['activo'] == true ? 'Activa' : 'Inactiva')),
++              onTap: () => Navigator.of(context).push(
++                MaterialPageRoute(
++                  builder: (_) => _LineDetailScreen(lineId: l['id_linea'] as int),
++                ),
++              ),
++            );
++          },
++        );
++      },
++    );
++  }
++}
++
++class _LineDetailScreen extends StatelessWidget {
++  final int lineId;
++  const _LineDetailScreen({required this.lineId});
++
++  @override
++  Widget build(BuildContext context) {
++    final transit = TransitService();
++    return Scaffold(
++      appBar: AppBar(title: Text('Línea #$lineId')),
++      body: FutureBuilder<List<Map<String, dynamic>>>(
++        future: transit.listRoutes(idLinea: lineId),
++        builder: (context, snap) {
++          if (snap.connectionState != ConnectionState.done) {
++            return const Center(child: CircularProgressIndicator());
++          }
++          if (snap.hasError) return Center(child: Text('Error: ${snap.error}'));
++          final list = snap.data ?? [];
++          if (list.isEmpty) {
++            return const Center(child: Text('Sin rutas'));
++          }
++          return ListView(
++            children: [
++              for (final r in list)
++                ListTile(
++                  leading: const Icon(Icons.route),
++                  title: Text(r['nombre_ruta'] as String? ?? 'Ruta ${r['id_ruta']}'),
++                  subtitle: Text(r['descripcion_trazado'] as String? ?? ''),
++                ),
++            ],
++          );
++        },
++      ),
++    );
++  }
++}
++
++class _ControlVehiclesTab extends StatefulWidget {
++  const _ControlVehiclesTab();
++
++  @override
++  State<_ControlVehiclesTab> createState() => _ControlVehiclesTabState();
++}
++
++class _ControlVehiclesTabState extends State<_ControlVehiclesTab> {
++  final _transit = TransitService();
++  late Future<List<Map<String, dynamic>>> _vehicles =
++      _transit.activeVehicles();
++
++  void _reload() => setState(() {
++        _vehicles = _transit.activeVehicles();
++      });
++
++  @override
++  Widget build(BuildContext context) {
++    return Column(
++      children: [
++        Padding(
++          padding: const EdgeInsets.all(12),
++          child: Row(
++            children: [
++              const Expanded(
++                child: Text('Vehículos activos en tiempo real'),
++              ),
++              IconButton(
++                tooltip: 'Actualizar',
++                icon: const Icon(Icons.refresh),
++                onPressed: _reload,
++              ),
++            ],
++          ),
+         ),
+-        const SizedBox(height: 12),
+-        _panel(
+-          context: context,
+-          title: 'Acceso administrativo',
+-          icon: Icons.admin_panel_settings,
++        Expanded(
++          child: FutureBuilder<List<Map<String, dynamic>>>(
++            future: _vehicles,
++            builder: (context, snap) {
++              if (snap.connectionState != ConnectionState.done) {
++                return const Center(child: CircularProgressIndicator());
++              }
++              if (snap.hasError) {
++                return Center(child: Text('Error: ${snap.error}'));
++              }
++              final list = snap.data ?? [];
++              if (list.isEmpty) {
++                return const Center(child: Text('No hay vehículos activos'));
++              }
++              return ListView.builder(
++                itemCount: list.length,
++                itemBuilder: (context, i) {
++                  final v = list[i];
++                  final lat = v['latitud'] as double?;
++                  final lng = v['longitud'] as double?;
++                  return ListTile(
++                    leading: const Icon(Icons.directions_bus),
++                    title: Text('Placa: ${v['placa'] ?? '—'}'),
++                    subtitle: Text(
++                      'Chofer: ${v['nombre_chofer'] ?? '—'} • '
++                      'Línea: ${v['nombre_linea'] ?? '—'}',
++                    ),
++                    trailing: lat != null && lng != null
++                        ? Chip(label: Text('${lat.toStringAsFixed(3)}, ${lng.toStringAsFixed(3)}'))
++                        : null,
++                  );
++                },
++              );
++            },
++          ),
++        ),
++      ],
++    );
++  }
++}
++
++class _ControlChoferesTab extends StatefulWidget {
++  const _ControlChoferesTab();
++
++  @override
++  State<_ControlChoferesTab> createState() => _ControlChoferesTabState();
++}
++
++class _ControlChoferesTabState extends State<_ControlChoferesTab> {
++  final _transit = TransitService();
++  late Future<List<Map<String, dynamic>>> _choferes = _transit.allChoferes();
++
++  void _reload() => setState(() {
++        _choferes = _transit.allChoferes();
++      });
++
++  @override
++  Widget build(BuildContext context) {
++    return Column(
++      children: [
++        Padding(
++          padding: const EdgeInsets.all(12),
++          child: Row(
++            children: [
++              const Expanded(child: Text('Choferes registrados')),
++              IconButton(
++                tooltip: 'Actualizar',
++                icon: const Icon(Icons.refresh),
++                onPressed: _reload,
++              ),
++            ],
++          ),
++        ),
++        Expanded(
++          child: FutureBuilder<List<Map<String, dynamic>>>(
++            future: _choferes,
++            builder: (context, snap) {
++              if (snap.connectionState != ConnectionState.done) {
++                return const Center(child: CircularProgressIndicator());
++              }
++              if (snap.hasError) {
++                return Center(child: Text('Error: ${snap.error}'));
++              }
++              final list = snap.data ?? [];
++              if (list.isEmpty) {
++                return const Center(child: Text('No hay choferes'));
++              }
++              return ListView.builder(
++                itemCount: list.length,
++                itemBuilder: (context, i) {
++                  final c = list[i];
++                  final persona = c['persona'];
++                  String nombre = '';
++                  String ci = '';
++                  String telefono = '';
++                  if (persona is Map) {
++                    nombre = persona['nombre'] as String? ?? '';
++                    ci = persona['ci'] as String? ?? '';
++                    telefono = persona['telefono'] as String? ?? '';
++                  }
++                  return ListTile(
++                    leading: const Icon(Icons.badge_outlined),
++                    title: Text(nombre.isEmpty ? 'Chofer #${c['id_chofer']}' : nombre),
++                    subtitle: Text(
++                      'CI: $ci • Lic: ${c['licencia'] ?? '—'} • '
++                      'Tel: $telefono',
++                    ),
++                    trailing: Chip(
++                      label: Text(c['activo'] == true ? 'Activo' : 'Inactivo'),
++                    ),
++                  );
++                },
++              );
++            },
++          ),
++        ),
++      ],
++    );
++  }
++}
++
++class _ControlFinesTab extends StatefulWidget {
++  const _ControlFinesTab();
++
++  @override
++  State<_ControlFinesTab> createState() => _ControlFinesTabState();
++}
++
++class _ControlFinesTabState extends State<_ControlFinesTab> {
++  final _transit = TransitService();
++  late Future<List<Map<String, dynamic>>> _fines = _transit.finesIssuedByMe();
++
++  void _reload() => setState(() {
++        _fines = _transit.finesIssuedByMe();
++      });
++
++  Future<void> _createFine() async {
++    final choferIdCtrl = TextEditingController();
++    final motivoCtrl = TextEditingController();
++    final montoCtrl = TextEditingController(text: '0');
++    final result = await showDialog<bool>(
++      context: context,
++      builder: (ctx) => AlertDialog(
++        title: const Text('Nueva multa'),
++        content: Column(
++          mainAxisSize: MainAxisSize.min,
+           children: [
+-            FilledButton.icon(
+-              icon: const Icon(Icons.admin_panel_settings),
+-              label: const Text('Entrar al panel admin'),
+-              onPressed: () => Navigator.of(context).push(
+-                MaterialPageRoute(builder: (_) => const AdminScreen()),
++            TextField(
++              controller: choferIdCtrl,
++              decoration: const InputDecoration(
++                labelText: 'ID del chofer',
++                border: OutlineInputBorder(),
++              ),
++              keyboardType: TextInputType.number,
++            ),
++            const SizedBox(height: 12),
++            TextField(
++              controller: motivoCtrl,
++              decoration: const InputDecoration(
++                labelText: 'Motivo',
++                border: OutlineInputBorder(),
++              ),
++            ),
++            const SizedBox(height: 12),
++            TextField(
++              controller: montoCtrl,
++              decoration: const InputDecoration(
++                labelText: 'Monto (Bs.)',
++                border: OutlineInputBorder(),
+               ),
++              keyboardType: TextInputType.number,
+             ),
+           ],
+         ),
+-      ] else ...[
+-        _panel(
+-          context: context,
+-          title: 'Panel de cliente',
+-          icon: Icons.person_outline,
+-          children: [
+-            Text('Hola$name', style: Theme.of(context).textTheme.titleLarge),
+-            const SizedBox(height: 4),
+-            Text('Rol: ${_roleLabel(profile.role)}'),
+-            if (isCliente) ...[
+-              const SizedBox(height: 20),
+-              OutlinedButton(
+-                onPressed: () => _request(context, AppRole.transportista),
+-                child: const Text('Solicitar cuenta de transportista'),
+-              ),
+-              const SizedBox(height: 8),
+-              OutlinedButton(
+-                onPressed: () => _request(context, AppRole.control),
+-                child: const Text('Solicitar acceso al panel de control'),
++        actions: [
++          TextButton(
++            onPressed: () => Navigator.of(ctx).pop(false),
++            child: const Text('Cancelar'),
++          ),
++          FilledButton(
++            onPressed: () => Navigator.of(ctx).pop(true),
++            child: const Text('Crear'),
++          ),
++        ],
++      ),
++    );
++    if (result != true) return;
++    final choferId = int.tryParse(choferIdCtrl.text);
++    final monto = double.tryParse(montoCtrl.text);
++    if (choferId == null || monto == null || motivoCtrl.text.isEmpty) {
++      if (!mounted) return;
++      ScaffoldMessenger.of(context).showSnackBar(
++        const SnackBar(content: Text('Datos inválidos')),
++      );
++      return;
++    }
++    try {
++      await _transit.createFine(
++        choferId: choferId,
++        motivo: motivoCtrl.text,
++        monto: monto,
++      );
++      if (!mounted) return;
++      ScaffoldMessenger.of(context).showSnackBar(
++        const SnackBar(content: Text('Multa registrada')),
++      );
++      _reload();
++    } catch (e) {
++      if (!mounted) return;
++      ScaffoldMessenger.of(context).showSnackBar(
++        SnackBar(content: Text('No se pudo crear: $e')),
++      );
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Column(
++      children: [
++        Padding(
++          padding: const EdgeInsets.all(12),
++          child: Row(
++            children: [
++              const Expanded(child: Text('Multas que has emitido')),
++              FilledButton.icon(
++                icon: const Icon(Icons.add),
++                label: const Text('Nueva'),
++                onPressed: _createFine,
+               ),
+             ],
+-          ],
++          ),
++        ),
++        Expanded(
++          child: FutureBuilder<List<Map<String, dynamic>>>(
++            future: _fines,
++            builder: (context, snap) {
++              if (snap.connectionState != ConnectionState.done) {
++                return const Center(child: CircularProgressIndicator());
++              }
++              if (snap.hasError) {
++                return Center(child: Text('Error: ${snap.error}'));
++              }
++              final list = snap.data ?? [];
++              if (list.isEmpty) {
++                return const Center(child: Text('No has emitido multas'));
++              }
++              return ListView.builder(
++                itemCount: list.length,
++                itemBuilder: (context, i) {
++                  final m = list[i];
++                  return ListTile(
++                    leading: const Icon(Icons.gavel),
++                    title: Text(m['motivo'] as String? ?? 'Multa'),
++                    subtitle: Text(
++                      'Chofer: ${m['id_chofer']} • '
++                      'Monto: ${m['monto']} • '
++                      '${m['estado']} • '
++                      '${m['fecha_hora']?.toString().substring(0, 16)}',
++                    ),
++                    trailing: PopupMenuButton<String>(
++                      onSelected: (v) async {
++                        await _transit.setFineStatus(
++                            m['id_multa'] as int, v);
++                        _reload();
++                      },
++                      itemBuilder: (_) => const [
++                        PopupMenuItem(value: 'pendiente', child: Text('Pendiente')),
++                        PopupMenuItem(value: 'pagada', child: Text('Pagada')),
++                        PopupMenuItem(value: 'anulada', child: Text('Anulada')),
++                      ],
++                    ),
++                  );
++                },
++              );
++            },
++          ),
+         ),
+       ],
+-    ];
+-
+-    return ListView(
+-      padding: const EdgeInsets.all(24),
+-      children: children,
+     );
+   }
+ }
+ 
+-/// Pantalla completa del panel administrativo.
++/// ---------------------------------------------------------------------------
++/// ADMIN
++///   Pantalla completa del panel administrativo. Mantiene las 3 pestañas
++///   originales (Solicitudes, Roles, Herramientas).
++/// ---------------------------------------------------------------------------
+ class AdminScreen extends StatelessWidget {
+   const AdminScreen({super.key});
+ 
+@@ -163,34 +1025,6 @@ class AdminScreen extends StatelessWidget {
+   }
+ }
+ 
+-class TransportistaView extends StatelessWidget {
+-  const TransportistaView({super.key});
+-
+-  @override
+-  Widget build(BuildContext context) => const Center(
+-        child: Text('Panel del transportista (en construcción)'),
+-      );
+-}
+-
+-/// El control gestiona las solicitudes de rol igual que el administrador.
+-class ControlView extends StatelessWidget {
+-  const ControlView({super.key});
+-
+-  @override
+-  Widget build(BuildContext context) => Column(
+-        children: [
+-          const Padding(
+-            padding: EdgeInsets.fromLTRB(24, 16, 24, 0),
+-            child: Text(
+-              'Gestión de solicitudes de rol',
+-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+-            ),
+-          ),
+-          const Expanded(child: AdminView()),
+-        ],
+-      );
+-}
+-
+ /// Lista de solicitudes de rol que admin o control aprueban o rechazan.
+ class AdminView extends StatefulWidget {
+   const AdminView({super.key});
+@@ -258,7 +1092,7 @@ class _AdminViewState extends State<AdminView> {
+   }
+ }
+ 
+-/// Asignacion de roles (cliente / transportista / control) a usuarios.
++/// Asignacion de roles (cliente / chofer / control) a usuarios.
+ /// El rol 'admin' nunca aparece ni se puede asignar desde esta vista.
+ class UserRolesView extends StatefulWidget {
+   const UserRolesView({super.key});
+@@ -360,7 +1194,7 @@ class _UserRolesViewState extends State<UserRolesView> {
+                   final user = list[index];
+                   final options = <AppRole>[
+                     AppRole.cliente,
+-                    AppRole.transportista,
++                    AppRole.chofer,
+                     AppRole.control,
+                   ];
+                   return ListTile(
+@@ -412,7 +1246,7 @@ class ToolsView extends StatelessWidget {
+     (icon: Icons.dashboard, title: 'Dashboard', subtitle: 'Metricas generales'),
+     (icon: Icons.route, title: 'Lineas', subtitle: 'Administrar lineas de trufis'),
+     (icon: Icons.alt_route, title: 'Rutas', subtitle: 'Rutas y recorridos'),
+-    (icon: Icons.people_alt, title: 'Transportistas', subtitle: 'Conductors y vehiculos'),
++    (icon: Icons.people_alt, title: 'Choferes', subtitle: 'Conductores y vehiculos'),
+     (icon: Icons.bar_chart, title: 'Reportes', subtitle: 'Estadisticas y exportes'),
+     (icon: Icons.notifications_none, title: 'Notificaciones', subtitle: 'Avisos a usuarios'),
+     (icon: Icons.payments, title: 'Tarifas', subtitle: 'Precios y descuentos'),
+diff --git a/lib/main.dart b/lib/main.dart
+index fd0198e..e77e9a1 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -312,7 +312,14 @@ final FaresConfig cochabambaFaresConfig = FaresConfig(
+ 
+ Future<void> main() async {
+   WidgetsFlutterBinding.ensureInitialized();
+-  await initializeSupabase();
++  // Si se detectó la service_role key (privada) initializeSupabase lanza
++  // StateError. Lo atrapamos para que la app de rutas siga funcionando;
++  // AuthGate mostrará el aviso correspondiente en "Mi cuenta".
++  try {
++    await initializeSupabase();
++  } catch (_) {
++    // El mensaje se lee vía `supabaseInitWarning` en auth_gate.dart.
++  }
+ 
+   runTrufiApp(
+     AppConfiguration(
+diff --git a/lib/main_auth_test.dart b/lib/main_auth_test.dart
+index b34e3b4..027095b 100644
+--- a/lib/main_auth_test.dart
++++ b/lib/main_auth_test.dart
+@@ -5,7 +5,9 @@ import 'auth/supabase_config.dart';
+ 
+ Future<void> main() async {
+   WidgetsFlutterBinding.ensureInitialized();
+-  await initializeSupabase();
++  try {
++    await initializeSupabase();
++  } catch (_) {}
+   runApp(const MaterialApp(
+     debugShowCheckedModeBanner: false,
+     home: AuthGate(),
+diff --git a/lib/services/transit_service.dart b/lib/services/transit_service.dart
+new file mode 100644
+index 0000000..595d3bd
+--- /dev/null
++++ b/lib/services/transit_service.dart
+@@ -0,0 +1,396 @@
++import 'dart:async';
++import 'package:supabase_flutter/supabase_flutter.dart';
++
++import '../auth/auth_service.dart';
++import '../auth/supabase_config.dart';
++
++/// Capa de datos para las 14 tablas de transporte (linea, ruta, vehiculo,
++/// chofer, control, cliente, persona, aviso, multa, pago, historial_*).
++///
++/// Usa el mismo `Supabase.instance.client` que AuthService. Si Supabase no
++/// está configurado, todos los métodos lanzan [StateError] con el mensaje
++/// habitual; las vistas deben comprobar `isSupabaseConfigured` antes.
++class TransitService {
++  SupabaseClient get _client => Supabase.instance.client;
++
++  void _requireConfig() {
++    if (!isSupabaseInitialized) {
++      if (supabaseInitWarning != null) throw StateError(supabaseInitWarning!);
++      if (!isSupabaseConfigured) throw StateError(supabaseMissingConfigMessage);
++      throw StateError('Supabase no fue inicializado.');
++    }
++  }
++
++  // ===================== MODELOS DE DATOS =====================
++
++  /// Vehículo con su línea y nombre del chofer (para la vista de control).
++  static const String activeVehicleFields =
++      'id_vehiculo, placa, latitud, longitud, id_chofer, id_linea, nombre_linea, nombre_chofer';
++
++  Map<String, dynamic> _clean(Map<String, dynamic> row) {
++    return Map<String, dynamic>.from(row);
++  }
++
++  // ===================== LÍNEAS Y RUTAS (lectura pública) =====================
++
++  /// Lista de líneas activas. Visible para cualquier usuario autenticado.
++  Future<List<Map<String, dynamic>>> listLines({bool activeOnly = true}) async {
++    _requireConfig();
++    var q = _client.from('linea').select().order('nombre_linea');
++    if (activeOnly) q = q.eq('activo', true);
++    final rows = await q;
++    return rows.map(_clean).toList();
++  }
++
++  /// Rutas de una línea (o todas si idLinea es null).
++  Future<List<Map<String, dynamic>>> listRoutes({int? idLinea}) async {
++    _requireConfig();
++    var q = _client.from('ruta').select().order('nombre_ruta');
++    if (idLinea != null) q = q.eq('id_linea', idLinea);
++    final rows = await q;
++    return rows.map(_clean).toList();
++  }
++
++  // ===================== CHOFER =====================
++
++  /// Vehículo asignado al chofer autenticado.
++  /// Usa el RPC `my_assigned_vehicle` para respetar la RLS.
++  Future<Map<String, dynamic>?> myVehicle() async {
++    _requireConfig();
++    final rows = await _client.rpc('my_assigned_vehicle');
++    if (rows is! List || rows.isEmpty) return null;
++    return Map<String, dynamic>.from(rows.first as Map);
++  }
++
++  /// Historial de viajes del chofer autenticado.
++  Future<List<Map<String, dynamic>>> myTripHistory({int limit = 50}) async {
++    _requireConfig();
++    final rows = await _client
++        .from('historial_vehiculo_viaje')
++        .select()
++        .eq('id_chofer', await _myChoferId())
++        .order('fecha_inicio', ascending: false)
++        .limit(limit);
++    return rows.map(_clean).toList();
++  }
++
++  /// Multas del chofer autenticado.
++  Future<List<Map<String, dynamic>>> myFines() async {
++    _requireConfig();
++    final rows = await _client
++        .from('multa')
++        .select()
++        .eq('id_chofer', await _myChoferId())
++        .order('fecha_hora', ascending: false);
++    return rows.map(_clean).toList();
++  }
++
++  /// Actualiza la ubicación del vehículo del chofer.
++  Future<void> updateMyLocation(double lat, double lng) async {
++    _requireConfig();
++    await _client.rpc(
++      'upsert_vehicle_location',
++      params: {'new_lat': lat, 'new_lng': lng},
++    );
++  }
++
++  /// Registra un reporte (incidente, retraso, etc.) del chofer.
++  Future<void> reportIncident({
++    required int choferId,
++    required String estado,
++    required String observacion,
++  }) async {
++    _requireConfig();
++    await _client.rpc(
++      'report_incident',
++      params: {
++        'p_id_chofer': choferId,
++        'p_estado': estado,
++        'p_observacion': observacion,
++      },
++    );
++  }
++
++  /// Inicia un viaje: inserta en historial_vehiculo_viaje.
++  Future<void> startTrip({
++    required int vehiculoId,
++    required int rutaId,
++    int? pasajeros,
++  }) async {
++    _requireConfig();
++    final choferId = await _myChoferId();
++    await _client.from('historial_vehiculo_viaje').insert({
++      'id_vehiculo': vehiculoId,
++      'id_ruta': rutaId,
++      'id_chofer': choferId,
++      'fecha_inicio': DateTime.now().toUtc().toIso8601String(),
++      'cantidad_pasajeros': pasajeros ?? 0,
++    });
++  }
++
++  /// Cierra el viaje activo del chofer (sin fecha_fin).
++  Future<void> endActiveTrip({String? observacionTiempo}) async {
++    _requireConfig();
++    final choferId = await _myChoferId();
++    await _client
++        .from('historial_vehiculo_viaje')
++        .update({
++          'fecha_fin': DateTime.now().toUtc().toIso8601String(),
++          'observacion_tiempo': observacionTiempo,
++        })
++        .eq('id_chofer', choferId)
++        .is('fecha_fin', null);
++  }
++
++  // ===================== CONTROL =====================
++
++  /// Líneas que gestiona el control autenticado (o todas si es admin).
++  Future<List<Map<String, dynamic>>> myManagedLines() async {
++    _requireConfig();
++    final rows = await _client.rpc('my_lines');
++    if (rows is! List) return [];
++    return rows.map((r) => Map<String, dynamic>.from(r as Map)).toList();
++  }
++
++  /// Vehículos activos con chofer y línea, para el mapa de control.
++  Future<List<Map<String, dynamic>>> activeVehicles() async {
++    _requireConfig();
++    final rows = await _client.rpc('active_vehicles');
++    if (rows is! List) return [];
++    return rows.map((r) => Map<String, dynamic>.from(r as Map)).toList();
++  }
++
++  /// Choferes de una línea (para el panel de control).
++  /// Hace tres consultas y los une en Dart para no depender de FK.
++  Future<List<Map<String, dynamic>>> choferesOfLine(int idLinea) async {
++    _requireConfig();
++    // 1) Vehículos activos de la línea -> sus choferes.
++    final vehiculos = await _client
++        .from('vehiculo')
++        .select('id_chofer')
++        .eq('id_linea', idLinea)
++        .eq('activo', true);
++    if (vehiculos.isEmpty) return [];
++    final choferIds = vehiculos
++        .map((v) => v['id_chofer'])
++        .whereType<int>()
++        .toSet();
++    if (choferIds.isEmpty) return [];
++    // 2) Choferes con esos ids.
++    final choferesRows = await _client
++        .from('chofer')
++        .select('id_chofer, id_persona, licencia, foto_url, activo')
++        .inFilter('id_chofer', choferIds.toList());
++    // 3) Personas correspondientes.
++    final personaIds = choferesRows
++        .map((c) => c['id_persona'])
++        .whereType<int>()
++        .toSet();
++    final personasRows = personaIds.isEmpty
++        ? <Map<String, dynamic>>[]
++        : await _client
++            .from('persona')
++            .select('id_persona, nombre, ci, telefono')
++            .inFilter('id_persona', personaIds.toList());
++    final personaById = <int, Map<String, dynamic>>{
++      for (final p in personasRows)
++        if (p['id_persona'] is int) p['id_persona'] as int: Map<String, dynamic>.from(p),
++    };
++    return choferesRows.map((c) {
++      final m = Map<String, dynamic>.from(c);
++      final pid = c['id_persona'];
++      m['persona'] = (pid is int && personaById.containsKey(pid))
++          ? personaById[pid]
++          : <String, dynamic>{};
++      return m;
++    }).toList();
++  }
++
++  /// Lista todos los choferes (solo control/admin).
++  /// Hace dos consultas y los une en Dart para no depender de FK.
++  Future<List<Map<String, dynamic>>> allChoferes() async {
++    _requireConfig();
++    final choferesRows = await _client
++        .from('chofer')
++        .select('id_chofer, id_persona, licencia, foto_url, activo')
++        .order('activo', ascending: false);
++    final personasRows = await _client
++        .from('persona')
++        .select('id_persona, nombre, ci, telefono');
++    final personaById = <int, Map<String, dynamic>>{
++      for (final p in personasRows)
++        if (p['id_persona'] is int) p['id_persona'] as int: Map<String, dynamic>.from(p),
++    };
++    return choferesRows.map((c) {
++      final m = Map<String, dynamic>.from(c);
++      final pid = c['id_persona'];
++      if (pid is int && personaById.containsKey(pid)) {
++        m['persona'] = personaById[pid];
++      } else {
++        m['persona'] = {};
++      }
++      return m;
++    }).toList();
++  }
++
++  /// Multas que el control ha emitido.
++  Future<List<Map<String, dynamic>>> finesIssuedByMe() async {
++    _requireConfig();
++    final controlId = await _myControlId();
++    if (controlId == null) return [];
++    final rows = await _client
++        .from('multa')
++        .select()
++        .eq('id_control', controlId)
++        .order('fecha_hora', ascending: false);
++    return rows.map(_clean).toList();
++  }
++
++  /// Crea una multa (solo control/admin).
++  Future<void> createFine({
++    required int choferId,
++    required String motivo,
++    required double monto,
++  }) async {
++    _requireConfig();
++    final controlId = await _myControlId();
++    await _client.from('multa').insert({
++      'id_chofer': choferId,
++      'id_control': controlId,
++      'motivo': motivo,
++      'monto': monto,
++      'fecha_hora': DateTime.now().toUtc().toIso8601String(),
++      'estado': 'pendiente',
++    });
++  }
++
++  /// Cambia el estado de una multa (pagada, anulada, etc.).
++  Future<void> setFineStatus(int fineId, String estado) async {
++    _requireConfig();
++    await _client
++        .from('multa')
++        .update({'estado': estado, 'updated_at': DateTime.now().toUtc().toIso8601String()})
++        .eq('id_multa', fineId);
++  }
++
++  /// Avisos creados por el control autenticado.
++  Future<List<Map<String, dynamic>>> myAvisos() async {
++    _requireConfig();
++    final controlId = await _myControlId();
++    if (controlId == null) return [];
++    final rows = await _client
++        .from('aviso')
++        .select()
++        .eq('id_control', controlId)
++        .order('fecha_hora', ascending: false);
++    return rows.map(_clean).toList();
++  }
++
++  /// Crea un aviso (a un cliente específico o a una ruta entera).
++  Future<int> createAviso({
++    String? mensaje,
++    int? rutaId,
++    int? clienteId,
++  }) async {
++    _requireConfig();
++    final id = await _client.rpc(
++      'create_aviso',
++      params: {
++        'p_mensaje': mensaje,
++        'p_id_ruta': rutaId,
++        'p_id_cliente': clienteId,
++      },
++    );
++    return (id is int) ? id : int.tryParse('$id') ?? 0;
++  }
++
++  // ===================== CLIENTE =====================
++
++  /// Avisos dirigidos al cliente autenticado.
++  Future<List<Map<String, dynamic>>> myAvisosAsCliente() async {
++    _requireConfig();
++    final clienteId = await _myClienteId();
++    if (clienteId == null) return [];
++    final rows = await _client
++        .from('aviso')
++        .select()
++        .eq('id_cliente', clienteId)
++        .order('fecha_hora', ascending: false);
++    return rows.map(_clean).toList();
++  }
++
++  /// Pagos del cliente autenticado.
++  Future<List<Map<String, dynamic>>> myPayments() async {
++    _requireConfig();
++    final clienteId = await _myClienteId();
++    if (clienteId == null) return [];
++    final rows = await _client
++        .from('pago')
++        .select()
++        .eq('id_cliente', clienteId)
++        .order('fecha_hora', ascending: false);
++    return rows.map(_clean).toList();
++  }
++
++  // ===================== REALTIME =====================
++
++  /// Suscripción a cambios en `vehiculo` (ubicación de choferes en vivo).
++  /// Solo有意义 para la vista de control / cliente-map.
++  Stream<List<Map<String, dynamic>>> watchActiveVehicles() {
++    _requireConfig();
++    final controller = StreamController<List<Map<String, dynamic>>>.broadcast();
++    Future<void> refresh() async {
++      try {
++        final rows = await _client
++            .from('vehiculo')
++            .select('id_vehiculo, placa, latitud, longitud, id_chofer, id_linea, activo')
++            .eq('activo', true);
++        controller.add(rows.map(_clean).toList());
++      } catch (e) {
++        controller.addError(e);
++      }
++    }
++
++    refresh();
++    final channel = _client
++        .channel('vehiculos_active')
++        .onPostgresChanges(
++          event: PostgresChangeEvent.all,
++          schema: 'public',
++          table: 'vehiculo',
++          callback: (_) => refresh(),
++        )
++        .subscribe();
++
++    controller.onCancel = () {
++      _client.removeChannel(channel);
++    };
++
++    return controller.stream;
++  }
++
++  // ===================== HELPERS INTERNOS =====================
++
++  Future<int?> _myChoferId() async {
++    final v = await _client.rpc('my_chofer_id');
++    return v is int ? v : int.tryParse('$v');
++  }
++
++  Future<int?> _myControlId() async {
++    final v = await _client.rpc('my_control_id');
++    return v is int ? v : int.tryParse('$v');
++  }
++
++  Future<int?> _myClienteId() async {
++    final v = await _client.rpc('my_cliente_id');
++    return v is int ? v : int.tryParse('$v');
++  }
++
++  /// Role actual leído desde el backend (más confiable que cachearlo).
++  Future<AppRole> currentRole() async {
++    _requireConfig();
++    final v = await _client.rpc('my_role');
++    final s = v is String ? v : v.toString();
++    return roleFromString(s);
++  }
++}
+diff --git a/supabase/chofer_control_migration.sql b/supabase/chofer_control_migration.sql
+new file mode 100644
+index 0000000..6b4680b
+--- /dev/null
++++ b/supabase/chofer_control_migration.sql
+@@ -0,0 +1,576 @@
++-- =============================================================================
++-- chofer_control_migration.sql
++-- Migración para: (1) añadir rol "chofer", (2) arreglar GRANTs y RLS en las 14
++-- tablas de transporte, (3) añadir helpers y funciones RPC para las vistas de
++-- chofer, control y cliente.
++--
++-- IDEMPOTENTE: se puede pegar completo en el SQL Editor y ejecutar cuantas
++-- veces sea necesario. No borra datos existentes.
++--
++-- NOTA: No se envuelve en BEGIN/COMMIT porque ALTER TYPE ... ADD VALUE no
++-- puede ejecutarse dentro de una transacción. Las sentencias son
++-- idempotentes (CREATE OR REPLACE, DROP IF EXISTS, CREATE INDEX IF NOT
++-- EXISTS) así que un fallo a mitad no deja el esquema inconsistente.
++--
++-- Ejecutar en: Supabase Dashboard → SQL Editor → New query → pegar → Run.
++-- =============================================================================
++
++-- ---------------------------------------------------------------------------
++-- 0. Asegurar enum app_role con 'chofer' y migrar 'transportista' -> 'chofer'
++-- ---------------------------------------------------------------------------
++do $$
++begin
++  -- Añade 'chofer' al enum si no existe.
++  if not exists (
++    select 1 from pg_type t
++    join pg_namespace n on n.oid = t.typnamespace
++    where t.typname = 'app_role' and n.nspname = 'public'
++  ) then
++    execute 'create type public.app_role as enum (''cliente'', ''chofer'', ''control'', ''admin'')';
++  elsif not exists (
++    select 1 from pg_enum
++    where enumlabel = 'chofer'
++      and enumtypid = (select oid from pg_type where typname = 'app_role' and typnamespace = 'public'::regnamespace)
++  ) then
++    execute 'alter type public.app_role add value if not exists ''chofer''';
++  end if;
++end $$;
++
++-- Migrar cualquier fila con role='transportista' a 'chofer' (sólo si la
++-- columna role es de tipo app_role y contiene 'transportista').
++do $$
++begin
++  if exists (
++    select 1 from information_schema.columns c
++    join information_schema.tables t on t.table_schema = c.table_schema and t.table_name = c.table_name
++    where c.table_schema = 'public' and c.table_name = 'profiles' and c.column_name = 'role'
++      and c.data_type = 'USER-DEFINED'
++  ) then
++    -- Sólo si 'transportista' sigue siendo un valor válido del enum, migrarlo.
++    if exists (
++      select 1 from pg_enum
++      where enumlabel = 'transportista'
++        and enumtypid = (select oid from pg_type where typname = 'app_role')
++    ) then
++      -- Si 'chofer' ya existe en el enum, actualizamos las filas y luego
++      -- (en otra sesión, no aquí) se puede quitar 'transportista'. No
++      -- removemos el valor aquí porque ALTER TYPE ... DROP VALUE no se
++      -- soporta en una transacción.
++      update public.profiles set role = 'chofer'::public.app_role
++        where role = 'transportista'::public.app_role;
++    end if;
++  end if;
++end $$;
++
++-- ---------------------------------------------------------------------------
++-- 1. GRANTs sobre las 14 tablas de transporte + profiles.
++-- Sin esto TODA lectura falla con 42501 "permission denied for table".
++-- ---------------------------------------------------------------------------
++grant usage on schema public to anon, authenticated;
++
++-- Lectura pública de tablas "informativas" (líneas y rutas) para que la app
++-- cliente las pueda mostrar sin login.
++grant select on public.linea to anon, authenticated;
++grant select on public.ruta to anon, authenticated;
++
++-- Las demás tablas: SELECT para authenticated; INSERT/UPDATE/DELETE sólo
++-- para authenticated (las policies más abajo limitan por rol y por usuario).
++grant select on public.profiles to anon, authenticated;
++grant select on public.persona to authenticated;
++grant select on public.usuario to authenticated;
++grant select on public.cliente to authenticated;
++grant select on public.chofer to authenticated;
++grant select on public.control to authenticated;
++grant select on public.administrador to authenticated;
++grant select on public.vehiculo to authenticated;
++grant select on public.historial_vehiculo_viaje to authenticated;
++grant select on public.historial_chofer_control to authenticated;
++grant select on public.multa to authenticated;
++grant select on public.pago to authenticated;
++grant select on public.aviso to authenticated;
++
++grant insert, update, delete on public.profiles to authenticated;
++grant insert, update, delete on public.persona to authenticated;
++grant insert, update, delete on public.usuario to authenticated;
++grant insert, update, delete on public.cliente to authenticated;
++grant insert, update, delete on public.chofer to authenticated;
++grant insert, update, delete on public.control to authenticated;
++grant insert, update, delete on public.administrador to authenticated;
++grant insert, update, delete on public.vehiculo to authenticated;
++grant insert, update, delete on public.historial_vehiculo_viaje to authenticated;
++grant insert, update, delete on public.historial_chofer_control to authenticated;
++grant insert, update, delete on public.multa to authenticated;
++grant insert, update, delete on public.pago to authenticated;
++grant insert, update, delete on public.aviso to authenticated;
++
++-- Permisos de secuencia para INSERT con id serial.
++grant usage, select on all sequences in schema public to authenticated;
++
++-- ---------------------------------------------------------------------------
++-- 2. Funciones helper y RPC ya existentes (re-crear por si faltan GRANTs).
++-- ---------------------------------------------------------------------------
++create or replace function public.is_admin()
++returns boolean language sql stable security definer set search_path = public as $$
++  select exists (
++    select 1 from public.profiles
++     where id = auth.uid() and role = 'admin'
++  );
++$$;
++
++create or replace function public.is_control()
++returns boolean language sql stable security definer set search_path = public as $$
++  select exists (
++    select 1 from public.profiles p
++    where p.id = auth.uid() and p.role = 'control'
++  );
++$$;
++
++create or replace function public.is_chofer()
++returns boolean language sql stable security definer set search_path = public as $$
++  select exists (
++    select 1 from public.profiles p
++    where p.id = auth.uid() and p.role = 'chofer'
++  );
++$$;
++
++create or replace function public.can_manage_requests()
++returns boolean language sql stable security definer set search_path = public as $$
++  select public.is_admin() or public.is_control();
++$$;
++
++-- ---------------------------------------------------------------------------
++-- 3. Nuevos helpers: ¿cuál es mi persona / chofer / control?
++-- ---------------------------------------------------------------------------
++create or replace function public.my_role()
++returns text language sql stable security definer set search_path = public as $$
++  select coalesce((select role::text from public.profiles where id = auth.uid()), 'cliente');
++$$;
++
++create or replace function public.my_persona_id()
++returns integer language sql stable security definer set search_path = public as $$
++  select p.id_persona from public.persona p where p.id_usuario = auth.uid()::text limit 1;
++$$;
++
++create or replace function public.my_chofer_id()
++returns integer language sql stable security definer set search_path = public as $$
++  select c.id_chofer from public.chofer c where c.id_persona = public.my_persona_id() limit 1;
++$$;
++
++create or replace function public.my_control_id()
++returns integer language sql stable security definer set search_path = public as $$
++  select c.id_control from public.control c where c.id_persona = public.my_persona_id() limit 1;
++$$;
++
++create or replace function public.my_cliente_id()
++returns integer language sql stable security definer set search_path = public as $$
++  select c.id_cliente from public.cliente c where c.id_persona = public.my_persona_id() limit 1;
++$$;
++
++-- ---------------------------------------------------------------------------
++-- 4. RLS — habilitar y crear políticas por tabla
++-- ---------------------------------------------------------------------------
++alter table public.profiles enable row level security;
++alter table public.persona enable row level security;
++alter table public.usuario enable row level security;
++alter table public.cliente enable row level security;
++alter table public.chofer enable row level security;
++alter table public.control enable row level security;
++alter table public.administrador enable row level security;
++alter table public.linea enable row level security;
++alter table public.ruta enable row level security;
++alter table public.vehiculo enable row level security;
++alter table public.historial_vehiculo_viaje enable row level security;
++alter table public.historial_chofer_control enable row level security;
++alter table public.multa enable row level security;
++alter table public.pago enable row level security;
++alter table public.aviso enable row level security;
++
++-- profiles: ya tiene policies; las reforzamos por si faltan.
++drop policy if exists "ver perfil propio o admin o control" on public.profiles;
++create policy "ver perfil propio o admin o control"
++  on public.profiles for select to authenticated
++  using (id = auth.uid() or public.is_admin() or public.is_control());
++
++drop policy if exists "editar perfil propio" on public.profiles;
++create policy "editar perfil propio"
++  on public.profiles for update to authenticated
++  using (id = auth.uid())
++  with check (id = auth.uid() and (requested_role is null or requested_role in ('chofer','control')));
++
++revoke update on public.profiles from authenticated;
++grant update (full_name, requested_role) on public.profiles to authenticated;
++
++-- persona / usuario: self + admin/control leen todo.
++drop policy if exists "persona select self o gestor" on public.persona;
++create policy "persona select self o gestor"
++  on public.persona for select to authenticated
++  using (id_usuario = auth.uid()::text or public.is_admin() or public.is_control());
++
++drop policy if exists "persona upsert self" on public.persona;
++create policy "persona upsert self"
++  on public.persona for insert to authenticated with check (id_usuario = auth.uid()::text);
++
++drop policy if exists "persona update self" on public.persona;
++create policy "persona update self"
++  on public.persona for update to authenticated using (id_usuario = auth.uid()::text)
++  with check (id_usuario = auth.uid()::text);
++
++drop policy if exists "usuario select self o gestor" on public.usuario;
++create policy "usuario select self o gestor"
++  on public.usuario for select to authenticated
++  using (id_usuario = auth.uid()::text or public.is_admin() or public.is_control());
++
++-- cliente: self + admin/control.
++drop policy if exists "cliente select self o gestor" on public.cliente;
++create policy "cliente select self o gestor"
++  on public.cliente for select to authenticated
++  using (id_persona = public.my_persona_id() or public.is_admin() or public.is_control());
++
++-- chofer: self + control + admin.
++drop policy if exists "chofer select self o gestores" on public.chofer;
++create policy "chofer select self o gestores"
++  on public.chofer for select to authenticated
++  using (id_persona = public.my_persona_id() or public.is_admin() or public.is_control());
++
++-- control: self + admin.
++drop policy if exists "control select self o admin" on public.control;
++create policy "control select self o admin"
++  on public.control for select to authenticated
++  using (id_persona = public.my_persona_id() or public.is_admin());
++
++-- administrador: sólo admin lee.
++drop policy if exists "admin select solo admin" on public.administrador;
++create policy "admin select solo admin"
++  on public.administrador for select to authenticated using (public.is_admin());
++
++-- linea / ruta: lectura pública para cualquiera autenticado.
++drop policy if exists "linea select any" on public.linea;
++create policy "linea select any" on public.linea for select to anon, authenticated using (true);
++
++drop policy if exists "linea write admin control" on public.linea;
++create policy "linea write admin control"
++  on public.linea for all to authenticated
++  using (public.is_admin() or public.is_control())
++  with check (public.is_admin() or public.is_control());
++
++drop policy if exists "ruta select any" on public.ruta;
++create policy "ruta select any" on public.ruta for select to anon, authenticated using (true);
++
++drop policy if exists "ruta write admin control" on public.ruta;
++create policy "ruta write admin control"
++  on public.ruta for all to authenticated
++  using (public.is_admin() or public.is_control())
++  with check (public.is_admin() or public.is_control());
++
++-- vehiculo: chofer ve el suyo; control/admin ven todos; authenticated ven
++-- activos (para mostrar ubicación en el mapa del cliente).
++drop policy if exists "vehiculo select" on public.vehiculo;
++create policy "vehiculo select"
++  on public.vehiculo for select to authenticated
++  using (
++    id_chofer = public.my_chofer_id()
++    or public.is_admin()
++    or public.is_control()
++    or activo = true   -- cliente ve vehículos activos (para mapa)
++  );
++
++drop policy if exists "vehiculo update self chofer" on public.vehiculo;
++create policy "vehiculo update self chofer"
++  on public.vehiculo for update to authenticated
++  using (id_chofer = public.my_chofer_id() or public.is_admin() or public.is_control())
++  with check (true);
++
++drop policy if exists "vehiculo write gestores" on public.vehiculo;
++create policy "vehiculo write gestores"
++  on public.vehiculo for insert to authenticated
++  with check (public.is_admin() or public.is_control());
++
++-- historial_vehiculo_viaje: chofer ve los suyos; control/admin todos.
++drop policy if exists "hv select self o gestores" on public.historial_vehiculo_viaje;
++create policy "hv select self o gestores"
++  on public.historial_vehiculo_viaje for select to authenticated
++  using (id_chofer = public.my_chofer_id() or public.is_admin() or public.is_control());
++
++drop policy if exists "hv write gestores o self" on public.historial_vehiculo_viaje;
++create policy "hv write gestores o self"
++  on public.historial_vehiculo_viaje for insert to authenticated
++  with check (id_chofer = public.my_chofer_id() or public.is_admin() or public.is_control());
++
++-- historial_chofer_control: chofer ve los suyos; control/admin todos.
++drop policy if exists "hcc select self o gestores" on public.historial_chofer_control;
++create policy "hcc select self o gestores"
++  on public.historial_chofer_control for select to authenticated
++  using (id_chofer = public.my_chofer_id() or public.is_admin() or public.is_control());
++
++drop policy if exists "hcc write gestores o self" on public.historial_chofer_control;
++create policy "hcc write gestores o self"
++  on public.historial_chofer_control for insert to authenticated
++  with check (id_chofer = public.my_chofer_id() or id_control = public.my_control_id() or public.is_admin());
++
++-- multa: chofer ve las suyas; control/admin todos.
++drop policy if exists "multa select self o gestores" on public.multa;
++create policy "multa select self o gestores"
++  on public.multa for select to authenticated
++  using (id_chofer = public.my_chofer_id() or public.is_admin() or public.is_control());
++
++drop policy if exists "multa write gestores" on public.multa;
++create policy "multa write gestores"
++  on public.multa for insert to authenticated
++  with check (id_control = public.my_control_id() or public.is_admin());
++
++drop policy if exists "multa update gestores" on public.multa;
++create policy "multa update gestores"
++  on public.multa for update to authenticated
++  using (id_control = public.my_control_id() or public.is_admin())
++  with check (true);
++
++-- pago: cliente ve los suyos; control/admin todos.
++drop policy if exists "pago select self o gestores" on public.pago;
++create policy "pago select self o gestores"
++  on public.pago for select to authenticated
++  using (id_cliente = public.my_cliente_id() or public.is_admin() or public.is_control());
++
++-- aviso: cliente ve los dirigidos a él; control/admin ven todos los que emitió.
++drop policy if exists "aviso select" on public.aviso;
++create policy "aviso select"
++  on public.aviso for select to authenticated
++  using (
++    id_cliente = public.my_cliente_id()
++    or id_control = public.my_control_id()
++    or public.is_admin()
++    or public.is_control()
++  );
++
++drop policy if exists "aviso write control" on public.aviso;
++create policy "aviso write control"
++  on public.aviso for insert to authenticated
++  with check (id_control = public.my_control_id() or public.is_admin());
++
++-- ---------------------------------------------------------------------------
++-- 5. Funciones de aplicación para las vistas
++-- ---------------------------------------------------------------------------
++
++-- Vehículo asignado al chofer autenticado (o null si no tiene).
++create or replace function public.my_assigned_vehicle()
++returns table (
++  id_vehiculo integer, placa text, foto_url text,
++  latitud double precision, longitud double precision,
++  id_chofer integer, id_linea integer, activo boolean
++)
++language plpgsql stable security definer set search_path = public as $$
++begin
++  if not public.is_chofer() then
++    raise exception 'Solo un chofer puede ver su vehículo asignado';
++  end if;
++  return query select * from public.vehiculo where id_chofer = public.my_chofer_id() limit 1;
++end;
++$$;
++
++-- Líneas gestionadas por el control autenticado (o todas si es admin).
++create or replace function public.my_lines()
++returns table (id_linea integer, nombre_linea text, descripcion text, activo boolean)
++language plpgsql stable security definer set search_path = public as $$
++begin
++  if public.is_admin() then
++    return query select * from public.linea order by nombre_linea;
++  elsif public.is_control() then
++    return query
++      select l.* from public.linea l
++      join public.control c on c.id_linea = l.id_linea
++      where c.id_control = public.my_control_id()
++      order by l.nombre_linea;
++  else
++    raise exception 'Solo un control o admin puede listar sus lineas';
++  end if;
++end;
++$$;
++
++-- Vehículos activos con chofer y línea (para mapa de control).
++create or replace function public.active_vehicles()
++returns table (
++  id_vehiculo integer, placa text, latitud double precision, longitud double precision,
++  id_chofer integer, id_linea integer, nombre_linea text, nombre_chofer text
++)
++language plpgsql stable security definer set search_path = public as $$
++begin
++  if not (public.is_admin() or public.is_control()) then
++    raise exception 'Solo control o admin pueden ver vehículos activos';
++  end if;
++  return query
++    select v.id_vehiculo, v.placa, v.latitud, v.longitud,
++           v.id_chofer, v.id_linea, l.nombre_linea,
++           coalesce(p.nombre, '') as nombre_chofer
++      from public.vehiculo v
++      left join public.linea l on l.id_linea = v.id_linea
++      left join public.chofer ch on ch.id_chofer = v.id_chofer
++      left join public.persona p on p.id_persona = ch.id_persona
++      where v.activo = true
++      order by v.id_vehiculo;
++end;
++$$;
++
++-- Chofer actualiza su ubicación.
++create or replace function public.upsert_vehicle_location(
++  new_lat double precision, new_lng double precision
++)
++returns void language plpgsql security definer set search_path = public as $$
++begin
++  if not public.is_chofer() then
++    raise exception 'Solo un chofer puede actualizar la ubicación';
++  end if;
++  update public.vehiculo
++     set latitud = new_lat, longitud = new_lng, updated_at = now()
++   where id_chofer = public.my_chofer_id();
++end;
++$$;
++
++-- Chofer o control registra un incidente / reporte.
++create or replace function public.report_incident(
++  p_id_chofer integer, p_estado text, p_observacion text
++)
++returns void language plpgsql security definer set search_path = public as $$
++declare
++  v_control integer;
++begin
++  if not (public.is_chofer() or public.is_control() or public.is_admin()) then
++    raise exception 'No autorizado';
++  end if;
++  -- Si es chofer, sólo puede reportar sobre sí mismo; el control lo elige.
++  if public.is_chofer() and p_id_chofer <> public.my_chofer_id() then
++    raise exception 'Un chofer solo puede reportar sobre si mismo';
++  end if;
++  -- Busca el control de la línea del chofer.
++  select c.id_control into v_control
++    from public.control c
++    join public.vehiculo v on v.id_linea = c.id_linea
++   where v.id_chofer = p_id_chofer limit 1;
++  insert into public.historial_chofer_control
++    (id_chofer, id_control, fecha_hora, estado_reporte, observacion)
++  values (p_id_chofer, v_control, now(), p_estado, p_observacion);
++end;
++$$;
++
++-- Control envía un aviso a un cliente o a todos los de una ruta.
++create or replace function public.create_aviso(
++  p_id_ruta integer default null,
++  p_id_cliente integer default null,
++  p_mensaje text
++)
++returns integer language plpgsql security definer set search_path = public as $$
++declare p_id integer;
++begin
++  if not (public.is_control() or public.is_admin()) then
++    raise exception 'Solo control o admin pueden emitir avisos';
++  end if;
++  insert into public.aviso (id_control, id_ruta, id_cliente, mensaje, fecha_hora)
++  values (public.my_control_id(), p_id_ruta, p_id_cliente, p_mensaje, now())
++  returning id_aviso into p_id;
++  return p_id;
++end;
++$$;
++
++-- ---------------------------------------------------------------------------
++-- 6. GRANT EXECUTE sobre todas las funciones RPC
++-- ---------------------------------------------------------------------------
++revoke all on function public.is_admin() from public, anon;
++revoke all on function public.is_control() from public, anon;
++revoke all on function public.is_chofer() from public, anon;
++revoke all on function public.can_manage_requests() from public, anon;
++revoke all on function public.my_role() from public, anon;
++revoke all on function public.my_persona_id() from public, anon;
++revoke all on function public.my_chofer_id() from public, anon;
++revoke all on function public.my_control_id() from public, anon;
++revoke all on function public.my_cliente_id() from public, anon;
++revoke all on function public.my_assigned_vehicle() from public, anon;
++revoke all on function public.my_lines() from public, anon;
++revoke all on function public.active_vehicles() from public, anon;
++revoke all on function public.upsert_vehicle_location(double precision, double precision) from public, anon;
++revoke all on function public.report_incident(integer, text, text) from public, anon;
++revoke all on function public.create_aviso(integer, integer, text) from public, anon;
++revoke all on function public.ensure_profile() from public, anon;
++revoke all on function public.handle_new_user() from public, anon;
++revoke all on function public.decide_request(uuid, boolean) from public, anon;
++revoke all on function public.promote_to_control(uuid) from public, anon;
++revoke all on function public.list_clients() from public, anon;
++revoke all on function public.list_users() from public, anon;
++revoke all on function public.admin_set_role(uuid, public.app_role) from public, anon;
++
++grant execute on function public.is_admin() to authenticated;
++grant execute on function public.is_control() to authenticated;
++grant execute on function public.is_chofer() to authenticated;
++grant execute on function public.can_manage_requests() to authenticated;
++grant execute on function public.my_role() to authenticated;
++grant execute on function public.my_persona_id() to authenticated;
++grant execute on function public.my_chofer_id() to authenticated;
++grant execute on function public.my_control_id() to authenticated;
++grant execute on function public.my_cliente_id() to authenticated;
++grant execute on function public.my_assigned_vehicle() to authenticated;
++grant execute on function public.my_lines() to authenticated;
++grant execute on function public.active_vehicles() to authenticated;
++grant execute on function public.upsert_vehicle_location(double precision, double precision) to authenticated;
++grant execute on function public.report_incident(integer, text, text) to authenticated;
++grant execute on function public.create_aviso(integer, integer, text) to authenticated;
++grant execute on function public.ensure_profile() to authenticated;
++grant execute on function public.decide_request(uuid, boolean) to authenticated;
++grant execute on function public.promote_to_control(uuid) to authenticated;
++grant execute on function public.list_clients() to authenticated;
++grant execute on function public.list_users() to authenticated;
++grant execute on function public.admin_set_role(uuid, public.app_role) to authenticated;
++
++-- ---------------------------------------------------------------------------
++-- 7. Índices para acelerar las búsquedas por auth.uid()
++-- ---------------------------------------------------------------------------
++create index if not exists idx_persona_id_usuario on public.persona (id_usuario);
++create index if not exists idx_chofer_id_persona on public.chofer (id_persona);
++create index if not exists idx_control_id_persona on public.control (id_persona);
++create index if not exists idx_cliente_id_persona on public.cliente (id_persona);
++create index if not exists idx_vehiculo_id_chofer on public.vehiculo (id_chofer);
++create index if not exists idx_vehiculo_activo on public.vehiculo (activo) where activo = true;
++create index if not exists idx_aviso_id_cliente on public.aviso (id_cliente);
++create index if not exists idx_multa_id_chofer on public.multa (id_chofer);
++create index if not exists idx_historial_viaje_id_chofer on public.historial_vehiculo_viaje (id_chofer);
++
++-- ---------------------------------------------------------------------------
++-- 8. Trigger: al crear un usuario, también crear persona + cliente por defecto.
++-- ---------------------------------------------------------------------------
++create or replace function public.handle_new_user_full()
++returns trigger language plpgsql security definer set search_path = public as $$
++begin
++  -- profiles (rol por defecto: cliente)
++  insert into public.profiles (id, full_name)
++  values (new.id, coalesce(new.raw_user_meta_data->>'full_name', ''))
++  on conflict (id) do nothing;
++
++  -- usuario (espejo del auth user para el modelo relacional)
++  insert into public.usuario (id_usuario, email)
++  values (new.id::text, new.email)
++  on conflict (id_usuario) do update set email = excluded.email, updated_at = now();
++
++  -- persona (linked por id_usuario = auth.uid)
++  insert into public.persona (id_usuario, nombre, activo)
++  values (new.id::text, coalesce(new.raw_user_meta_data->>'full_name', ''), true)
++  on conflict do nothing;
++
++  -- cliente por defecto (lo mantiene como cliente hasta que un admin lo promueva)
++  insert into public.cliente (id_persona, tipo_cliente, activo)
++  select p.id_persona, 'regular', true
++    from public.persona p
++   where p.id_usuario = new.id::text
++     and not exists (select 1 from public.cliente c where c.id_persona = p.id_persona)
++  limit 1;
++
++  return new;
++end;
++$$;
++
++drop trigger if exists on_auth_user_created_full on auth.users;
++create trigger on_auth_user_created_full
++after insert on auth.users
++for each row execute function public.handle_new_user_full();
++
++notify pgrst, 'reload schema';
++
++-- =============================================================================
++-- FIN. Después de ejecutar, crear el primer admin a mano:
++--   update public.profiles set role = 'admin' where id = '<uuid-del-admin>';
++-- =============================================================================
+diff --git a/supabase/seed_demo_users.sql b/supabase/seed_demo_users.sql
+new file mode 100644
+index 0000000..e101a79
+--- /dev/null
++++ b/supabase/seed_demo_users.sql
+@@ -0,0 +1,161 @@
++-- =============================================================================
++-- seed_demo_users.sql
++-- Crea las filas en profiles/persona/chofer/control/vehiculo para los 4
++-- usuarios demo creados con la Auth Admin API.
++--
++-- EJECUTAR DESPUÉS de chofer_control_migration.sql.
++-- Idempotente: se puede repetir.
++-- =============================================================================
++
++-- UUIDs de los usuarios creados (auth.users):
++--   admin@trufi.cbba    → a3cfe6ba-e942-467a-826d-55e50cb21b2d
++--   control@trufi.cbba  → 702b67ce-a97f-475e-aee2-9fba5021362e
++--   chofer@trufi.cbba   → 7f2f170f-f2e2-4807-8182-8dee3fbb4dfa
++--   cliente@trufi.cbba  → fbfb8bf6-0fe5-4fca-929d-98eda04e1041
++
++-- ---------------------------------------------------------------------------
++-- 1. PROFILES: asignar rol a cada usuario.
++--    (El trigger on_auth_user_created de schema.sql ya creo la fila en
++--    profiles al crear el auth user; aquí sólo actualizamos el rol.)
++-- ---------------------------------------------------------------------------
++update public.profiles set role = 'admin'    where id = 'a3cfe6ba-e942-467a-826d-55e50cb21b2d';
++update public.profiles set role = 'control'  where id = '702b67ce-a97f-475e-aee2-9fba5021362e';
++update public.profiles set role = 'chofer'   where id = '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa';
++update public.profiles set role = 'cliente'  where id = 'fbfb8bf6-0fe5-4fca-929d-98eda04e1041';
++
++-- ---------------------------------------------------------------------------
++-- 2. PERSONA + USUARIO: el trigger on_auth_user_created_full de la migración
++--    debería haberlos creado, pero si la migración se aplicó DESPUÉS de
++--    crear los auth users, hay que hacerlo a mano. Insert or nothing.
++-- ---------------------------------------------------------------------------
++insert into public.usuario (id_usuario, email)
++select id::text, email from auth.users
++where id in (
++  'a3cfe6ba-e942-467a-826d-55e50cb21b2d',
++  '702b67ce-a97f-475e-aee2-9fba5021362e',
++  '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa',
++  'fbfb8bf6-0fe5-4fca-929d-98eda04e1041'
++)
++on conflict (id_usuario) do nothing;
++
++insert into public.persona (id_usuario, nombre, ci, telefono, activo)
++select u.id::text,
++       coalesce(u.raw_user_meta_data->>'full_name', ''),
++       '',
++       '',
++       true
++  from auth.users u
++ where u.id in (
++  'a3cfe6ba-e942-467a-826d-55e50cb21b2d',
++  '702b67ce-a97f-475e-aee2-9fba5021362e',
++  '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa',
++  'fbfb8bf6-0fe5-4fca-929d-98eda04e1041'
++)
++on conflict do nothing;
++
++-- ---------------------------------------------------------------------------
++-- 3. CLIENTE: fila para el cliente demo y para los demás (por consistencia).
++-- ---------------------------------------------------------------------------
++insert into public.cliente (id_persona, tipo_cliente, activo)
++select p.id_persona, 'regular', true
++  from public.persona p
++ where p.id_usuario in (
++  'a3cfe6ba-e942-467a-826d-55e50cb21b2d',
++  '702b67ce-a97f-475e-aee2-9fba5021362e',
++  '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa',
++  'fbfb8bf6-0fe5-4fca-929d-98eda04e1041'
++ )
++ and not exists (select 1 from public.cliente c where c.id_persona = p.id_persona)
++on conflict do nothing;
++
++-- ---------------------------------------------------------------------------
++-- 4. LÍNEA DEMO + RUTAS (si no hay líneas, crea una para que chofer y
++--    control tengan algo que gestionar).
++-- ---------------------------------------------------------------------------
++insert into public.linea (nombre_linea, descripcion, activo)
++select 'Línea 701 - Trufi', 'Trufi Cochabamba demo', true
++where not exists (select 1 from public.linea where nombre_linea = 'Línea 701 - Trufi')
++on conflict do nothing;
++
++insert into public.ruta (id_linea, nombre_ruta, descripcion_trazado, activo)
++select l.id_linea, 'Ruta Norte-Sur', 'Recorrido demo norte a sur', true
++  from public.linea l
++ where l.nombre_linea = 'Línea 701 - Trufi'
++   and not exists (select 1 from public.ruta r where r.id_linea = l.id_linea and r.nombre_ruta = 'Ruta Norte-Sur')
++on conflict do nothing;
++
++-- ---------------------------------------------------------------------------
++-- 5. CHOFER: fila para chofer@trufi.cbba (vinculada a su persona).
++-- ---------------------------------------------------------------------------
++insert into public.chofer (id_persona, licencia, foto_url, activo)
++select p.id_persona, 'CHOFER-DEMO-001', null, true
++  from public.persona p
++ where p.id_usuario = '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa'
++   and not exists (select 1 from public.chofer c where c.id_persona = p.id_persona)
++on conflict do nothing;
++
++-- ---------------------------------------------------------------------------
++-- 6. CONTROL: fila para control@trufi.cbba (vinculada a su persona y a la
++--    línea demo).
++-- ---------------------------------------------------------------------------
++insert into public.control (id_persona, id_admin, id_linea, activo)
++select p.id_persona, null, l.id_linea, true
++  from public.persona p
++  cross join public.linea l
++ where p.id_usuario = '702b67ce-a97f-475e-aee2-9fba5021362e'
++   and l.nombre_linea = 'Línea 701 - Trufi'
++   and not exists (select 1 from public.control c where c.id_persona = p.id_persona)
++on conflict do nothing;
++
++-- ---------------------------------------------------------------------------
++-- 7. VEHÍCULO: asigna un vehículo al chofer demo, en la línea demo.
++-- ---------------------------------------------------------------------------
++insert into public.vehiculo (placa, foto_url, latitud, longitud, id_chofer, id_linea, activo)
++select 'TRUFI-001', null, -17.3988354, -66.1626903, c.id_chofer, l.id_linea, true
++  from public.chofer c
++  cross join public.linea l
++  cross join public.persona p
++ where p.id_usuario = '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa'
++   and c.id_persona = p.id_persona
++   and l.nombre_linea = 'Línea 701 - Trufi'
++   and not exists (select 1 from public.vehiculo v where v.placa = 'TRUFI-001')
++on conflict do nothing;
++
++-- ---------------------------------------------------------------------------
++-- 8. Verificación (sólo muestra, no modifica).
++-- ---------------------------------------------------------------------------
++select 'perfiles' as tabla, id::text, role::text, full_name
++  from public.profiles
++ where id in (
++  'a3cfe6ba-e942-467a-826d-55e50cb21b2d',
++  '702b67ce-a97f-475e-aee2-9fba5021362e',
++  '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa',
++  'fbfb8bf6-0fe5-4fca-929d-98eda04e1041'
++ )
++union all
++select 'personas', id_usuario::text, nombre, ci
++  from public.persona
++ where id_usuario in (
++  'a3cfe6ba-e942-467a-826d-55e50cb21b2d',
++  '702b67ce-a97f-475e-aee2-9fba5021362e',
++  '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa',
++  'fbfb8bf6-0fe5-4fca-929d-98eda04e1041'
++ )
++union all
++select 'choferes', c.id_chofer::text, c.licencia, p.id_usuario
++  from public.chofer c
++  join public.persona p on p.id_persona = c.id_persona
++ where p.id_usuario = '7f2f170f-f2e2-4807-8182-8dee3fbb4dfa'
++union all
++select 'controles', c.id_control::text, c.id_linea::text, p.id_usuario
++  from public.control c
++  join public.persona p on p.id_persona = c.id_persona
++ where p.id_usuario = '702b67ce-a97f-475e-aee2-9fba5021362e'
++union all
++select 'vehiculos', v.id_vehiculo::text, v.placa, v.id_chofer::text
++  from public.vehiculo v
++ where v.placa = 'TRUFI-001';
++
++-- =============================================================================
++-- FIN.
++-- =============================================================================
+-- 
+2.47.3
+

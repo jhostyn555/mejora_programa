@@ -2,12 +2,42 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'supabase_config.dart';
 
-enum AppRole { cliente, transportista, control, admin }
+/// Roles de la aplicación.
+///
+/// `chofer` es el rol del conductor (antes llamado `transportista`; el enum
+/// de la base de datos se renombró en `chofer_control_migration.sql`).
+/// `roleFromString` acepta `'transportista'` por compatibilidad con perfiles
+/// que no se hayan migrado todavía.
+enum AppRole { cliente, chofer, control, admin }
 
-AppRole roleFromString(String? value) => AppRole.values.firstWhere(
-      (r) => r.name == value,
-      orElse: () => AppRole.cliente,
-    );
+AppRole roleFromString(String? value) {
+  switch (value) {
+    case 'chofer':
+    case 'transportista': // compatibilidad hacia atrás
+      return AppRole.chofer;
+    case 'control':
+      return AppRole.control;
+    case 'admin':
+      return AppRole.admin;
+    case 'cliente':
+    default:
+      return AppRole.cliente;
+  }
+}
+
+/// Nombre canónico que se guarda en la base de datos.
+String roleToDb(AppRole role) {
+  switch (role) {
+    case AppRole.chofer:
+      return 'chofer';
+    case AppRole.control:
+      return 'control';
+    case AppRole.admin:
+      return 'admin';
+    case AppRole.cliente:
+      return 'cliente';
+  }
+}
 
 class Profile {
   final String id;
@@ -63,8 +93,11 @@ class ManagedUser {
 class AuthService {
   SupabaseClient get _client => Supabase.instance.client;
 
-  /// False cuando la app se ejecuto sin las credenciales de Supabase.
-  bool get isConfigured => isSupabaseConfigured;
+  /// True sólo si las credenciales están definidas y `Supabase.initialize`
+  /// terminó OK. Devolver false aquí evita que los widgets intenten leer
+  /// `Supabase.instance.client` (que lanzaría StateError) en una app sin
+  /// configurar o donde la inicialización falló por detectar service_role.
+  bool get isConfigured => isSupabaseInitialized;
 
   bool get isSignedIn => isConfigured && _client.auth.currentSession != null;
 
@@ -76,7 +109,12 @@ class AuthService {
   User? get currentUser => isConfigured ? _client.auth.currentUser : null;
 
   void _requireConfig() {
-    if (!isConfigured) throw StateError(supabaseMissingConfigMessage);
+    if (!isConfigured) {
+      // Distingue los dos motivos para que el mensaje ayude a depurar.
+      if (supabaseInitWarning != null) throw StateError(supabaseInitWarning!);
+      if (!isSupabaseConfigured) throw StateError(supabaseMissingConfigMessage);
+      throw StateError('Supabase no fue inicializado.');
+    }
   }
 
   Future<void> signIn(String email, String password) async {
@@ -135,13 +173,16 @@ class AuthService {
     );
   }
 
-  /// El usuario pide ser transportista o control. Su rol no cambia hasta que
-  /// un administrador lo apruebe.
+  /// El usuario pide ser chofer o control. Su rol no cambia hasta que
+  /// un administrador o control lo apruebe.
   Future<void> requestRole(AppRole role) async {
     _requireConfig();
+    if (role != AppRole.chofer && role != AppRole.control) {
+      throw ArgumentError('Solo se puede solicitar chofer o control');
+    }
     await _client
         .from('profiles')
-        .update({'requested_role': role.name})
+        .update({'requested_role': roleToDb(role)})
         .eq('id', currentUser!.id);
   }
 
@@ -204,12 +245,12 @@ class AuthService {
         .toList();
   }
 
-  /// Asigna cliente/transportista/control. El backend rechaza 'admin'.
+  /// Asigna cliente/chofer/control. El backend rechaza 'admin'.
   Future<void> adminSetRole(String userId, AppRole role) async {
     _requireConfig();
     await _client.rpc(
       'admin_set_role',
-      params: {'target': userId, 'new_role': role.name},
+      params: {'target': userId, 'new_role': roleToDb(role)},
     );
   }
 }

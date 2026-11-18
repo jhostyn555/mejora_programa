@@ -57,7 +57,7 @@ class _RoleHomeState extends State<RoleHome> {
           final view = switch (profile.role) {
             AppRole.cliente || AppRole.admin =>
               ClienteView(profile: profile, onChanged: _reload),
-            AppRole.transportista => const TransportistaView(),
+            AppRole.chofer => const ChoferView(),
             AppRole.control => const ControlView(),
           };
 

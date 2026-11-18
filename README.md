@@ -118,17 +118,57 @@ Si no tienes Chrome instalado, usa `flutter run -d web-server --web-port 8080` y
 
 Para pruebas locales, desactiva **Authentication → Sign In / Providers → Email → Confirm email** en Supabase. Si no, el plan gratuito agota el cupo de correos por hora y aparece `email rate limit exceeded` al registrar cuentas (la app ya muestra un mensaje explicativo). En produccion vuelve a activarlo.
 
-Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque. Antes de usar roles, ejecuta [`supabase/schema.sql`](supabase/schema.sql) en el SQL Editor. Si ya tenias una base anterior, la forma mas simple es pegar [`supabase/apply_migrations.sql`](supabase/apply_migrations.sql) (incluye todo y es seguro repetirlo); por separado son [`supabase/roles_control_migration.sql`](supabase/roles_control_migration.sql) y [`supabase/admin_roles_options_migration.sql`](supabase/admin_roles_options_migration.sql). Ahi se crean los perfiles, las politicas y el primer administrador.
+Sin esos `dart-define` la app de rutas sigue funcionando, pero el acceso aparece deshabilitado con un aviso en vez de fallar en el arranque.
 
-**Roles y altas:**
+> **⚠️ IMPORTANTE — service_role key vs publishable key**
+> La `SUPABASE_ANON_KEY` debe ser la **publishable / anon key** (`sb_publishable_...` o un JWT `eyJ...`), **NUNCA** la service_role key (`sb_secret_...`). La service_role es privada y salta toda la RLS: si la pones en el cliente, cualquiera podría borrar cualquier tabla. Si se detecta, `initializeSupabase()` se niega a inicializar y AuthGate muestra el aviso en "Mi cuenta".
 
-- **Cliente**: al registrarse; puede pedir **transportista** o **control** desde **Mi cuenta**.
-- **Transportista**: se obtiene por solicitud aprobada por admin o control. Su panel esta vacio por ahora.
-- **Control**: el admin lo crea desde **Panel administrativo → Clientes**, buscando el correo del cliente y pulsando **Hacer control**. El control gestiona las solicitudes de rol en su propia vista.
-- **Admin**: ve dos paneles en **Mi cuenta**: el de cliente y un boton **Entrar al panel admin**. El panel tiene tres pestañas:
-  - **Solicitudes**: aprobar/rechazar roles pedidos por clientes.
-  - **Roles**: buscar cualquier usuario (no admin) y asignarle **cliente**, **transportista** o **control**. Cada rol abre su propia vista; **admin no se puede asignar desde la app**.
-  - **Herramientas**: opciones en construccion (Dashboard, Lineas, Rutas, Transportistas, Reportes, Notificaciones, Tarifas, Configuracion) listas para implementar despues.
+### Migración de la base de datos
+
+Antes de usar roles, ejecuta las migraciones en el SQL Editor de Supabase:
+
+1. **Esquema base** (perfiles, trigger on_auth_user_created, políticas de `profiles`): [`supabase/schema.sql`](supabase/schema.sql).
+2. **Roles de control y panel admin** (sólo si ya tenías una base anterior): [`supabase/apply_migrations.sql`](supabase/apply_migrations.sql) — incluye todo y es seguro repetirlo; por separado son [`supabase/roles_control_migration.sql`](supabase/roles_control_migration.sql) y [`supabase/admin_roles_options_migration.sql`](supabase/admin_roles_options_migration.sql).
+3. **Roles chofer + tablas de transporte** (GRANTs, RLS en las 14 tablas, helpers RPC): [`supabase/chofer_control_migration.sql`](supabase/chofer_control_migration.sql). Esta migración:
+   - Añade `chofer` al enum `app_role` y migra `transportista → chofer` en `profiles`.
+   - Hace `GRANT SELECT/INSERT/UPDATE/DELETE` sobre las 14 tablas de transporte a `authenticated` y `anon`.
+   - Crea políticas RLS por tabla: lectura pública de `linea`/`ruta`, self-read de `chofer`/`control`/`persona`, admin/control ven todo.
+   - Crea los helpers `my_persona_id()`, `my_chofer_id()`, `my_control_id()`, `my_role()`.
+   - Crea los RPC `my_assigned_vehicle()`, `my_lines()`, `active_vehicles()`, `upsert_vehicle_location()`, `report_incident()`, `create_aviso()`.
+   - Añade un trigger `on_auth_user_created_full` que al registrar un usuario también crea las filas en `usuario`, `persona` y `cliente` (rol por defecto).
+   - Crea índices en `persona(id_usuario)`, `chofer(id_persona)`, `vehiculo(id_chofer)` para acelerar las consultas por `auth.uid()`.
+
+Tras aplicar la migración, **crea el primer administrador a mano**:
+
+```sql
+update public.profiles set role = 'admin' where id = '<uuid-del-admin>';
+```
+
+### Roles y vistas (después de la migración)
+
+La app usa **cuatro roles** y cada uno abre una vista distinta al pulsar **Mi cuenta** en el menú lateral:
+
+| Rol | Vista principal | "Mi cuenta" |
+|---|---|---|
+| **Cliente** | La app de Trufi (mapa + planificador de rutas) | Perfil + avisos. **Sin opciones de panel.** Puede solicitar rol chofer o control desde un botón discreto. |
+| **Chofer** | La app de Trufi | Panel funcional: vehículo asignado (placa, línea, ubicación), iniciar/finalizar viaje, historial de viajes, multas, botón **Actualizar ubicación**. |
+| **Control** | La app de Trufi | Panel con 5 pestañas: Solicitudes de rol, Líneas (con detalle de rutas), Vehículos activos en tiempo real, Choferes registrados, Multas (crear y cambiar estado). |
+| **Admin** | La app de Trufi | Perfil + botón **Entrar al panel admin** con 3 pestañas: Solicitudes, Roles (asignar cliente/chofer/control a cualquier usuario), Herramientas. |
+
+**Cómo se asigna cada rol:**
+
+- **Cliente**: rol por defecto al registrarse. El trigger `on_auth_user_created_full` también crea las filas en `usuario`, `persona` y `cliente`.
+- **Chofer**: solicita el rol desde **Mi cuenta → "Solicitar cuenta de chofer"**. Un admin o control lo aprueba desde **Solicitudes**. Una vez aprobado, hay que crear manualmente la fila en `chofer` (con `id_persona` de la persona recién creada) y asignarle un vehículo desde `vehiculo.id_chofer`.
+- **Control**: el admin lo crea desde **Panel administrativo → Roles**, buscando el correo del usuario y cambiando su rol a `control` con el dropdown. También hay que crear la fila en `control` (con `id_persona` e `id_linea`).
+- **Admin**: **no se asigna desde la app**. Sólo se crea manualmente con el SQL de arriba.
+
+### Conexión con las 14 tablas de transporte
+
+Además de `profiles`, la app ahora usa (a través de `lib/services/transit_service.dart`):
+
+`linea`, `ruta`, `vehiculo`, `chofer`, `control`, `cliente`, `persona`, `usuario`, `aviso`, `multa`, `pago`, `historial_vehiculo_viaje`, `historial_chofer_control`, `administrador`.
+
+Estas tablas ya existían en Supabase pero **no tenían GRANTs ni políticas RLS** (sólo `profiles` las tenía). La migración de arriba arregla eso. Sin la migración, cualquier intento de leer `chofer`, `vehiculo`, etc. devuelve `42501 permission denied for table`.
 
 ## 🚀 Desarrollo
 

@@ -53,7 +53,15 @@ class AuthDrawerFooter extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (!isSupabaseConfigured)
+            if (supabaseInitWarning != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  supabaseInitWarning!,
+                  style: const TextStyle(fontSize: 12, color: Colors.red),
+                ),
+              )
+            else if (!isSupabaseConfigured)
               const Padding(
                 padding: EdgeInsets.only(bottom: 8),
                 child: Text(

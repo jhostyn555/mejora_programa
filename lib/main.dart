@@ -312,7 +312,14 @@ final FaresConfig cochabambaFaresConfig = FaresConfig(
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await initializeSupabase();
+  // Si se detectó la service_role key (privada) initializeSupabase lanza
+  // StateError. Lo atrapamos para que la app de rutas siga funcionando;
+  // AuthGate mostrará el aviso correspondiente en "Mi cuenta".
+  try {
+    await initializeSupabase();
+  } catch (_) {
+    // El mensaje se lee vía `supabaseInitWarning` en auth_gate.dart.
+  }
 
   runTrufiApp(
     AppConfiguration(
