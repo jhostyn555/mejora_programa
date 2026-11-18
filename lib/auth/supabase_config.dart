@@ -1,15 +1,20 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-/// Credenciales públicas de Supabase. Se inyectan al compilar/ejecutar:
+/// Configuración pública de sistema_transporte. Se puede reemplazar al compilar:
 ///
 /// flutter run -d chrome \
 ///   --dart-define=SUPABASE_URL=https://TU_PROYECTO.supabase.co \
 ///   --dart-define=SUPABASE_ANON_KEY=TU_PUBLISHABLE_KEY
 ///
-/// Cuando no estan definidas la app sigue funcionando como planificador de
-/// rutas; solo se desactivan el inicio de sesion y el panel de cuenta.
-const supabaseUrl = String.fromEnvironment('SUPABASE_URL');
-const supabasePublishableKey = String.fromEnvironment('SUPABASE_ANON_KEY');
+/// Para usar otro proyecto, proporciona la URL y la clave pública juntas.
+const supabaseUrl = String.fromEnvironment(
+  'SUPABASE_URL',
+  defaultValue: 'https://krlawtpedmifivabeuqg.supabase.co',
+);
+const supabasePublishableKey = String.fromEnvironment(
+  'SUPABASE_ANON_KEY',
+  defaultValue: 'sb_publishable_didN6atxGDfp_x_GyGP-9w_eX5648sQ',
+);
 
 /// True cuando las constantes de compilación están definidas (no vacías).
 /// No garantiza que `Supabase.initialize` se haya llamado — para eso usa
