@@ -1,0 +1,125 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+   <uses-permission android:name="android.permission.INTERNET"/>
+   <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+   <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+   <queries>
+     <intent>
+       <action android:name="android.intent.action.VIEW" />
+       <data android:scheme="https" />
+     </intent>
+     <intent>
+       <action android:name="android.intent.action.DIAL" />
+       <data android:scheme="tel" />
+     </intent>
+     <intent>
+       <action android:name="android.intent.action.SENDTO" />
+       <data android:scheme="smsto" />
+     </intent>
+     <intent>
+       <action android:name="android.intent.action.SEND" />
+       <data android:mimeType="*/*" />
+     </intent>
+   </queries>
+    <application
+        android:label="Trufi"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- App Links: any https://planner.trufi.app/... link opens the app directly.
+                 Matched at the host level (pathPrefix "/") so new shareable deep
+                 link types from this domain don't each need a new entry.
+                 Verified via https://planner.trufi.app/.well-known/assetlinks.json -->
+            <intent-filter android:autoVerify="true">
+              <action android:name="android.intent.action.VIEW" />
+              <category android:name="android.intent.category.DEFAULT" />
+              <category android:name="android.intent.category.BROWSABLE" />
+              <data android:scheme="https" android:host="planner.trufi.app" android:pathPrefix="/" />
+            </intent-filter>
+            <intent-filter>
+              <action android:name="android.intent.action.VIEW" />
+              <category android:name="android.intent.category.DEFAULT" />
+              <category android:name="android.intent.category.BROWSABLE" />
+              <data android:scheme="geo" />
+            </intent-filter>
+            <!-- Custom deep link scheme for route sharing and in-app
+                 navigation (e.g. trufiapp://routes?operator=X opens the
+                 routes list filtered by operator). -->
+            <intent-filter>
+              <action android:name="android.intent.action.VIEW" />
+              <category android:name="android.intent.category.DEFAULT" />
+              <category android:name="android.intent.category.BROWSABLE" />
+              <data android:scheme="trufiapp" android:host="route" />
+              <data android:scheme="trufiapp" android:host="routes" />
+            </intent-filter>
+            <!-- Deep links are handled by the app_links plugin (DeepLinkService
+                 in trufi-core). Since Flutter 3.27 the engine's built-in deep
+                 linking is on by default and ALSO pushes the raw URI into
+                 go_router, clobbering the in-app navigation on warm links —
+                 this opts the engine out so app_links stays the only handler. -->
+            <meta-data
+              android:name="flutter_deeplinking_enabled"
+              android:value="false" />
+        </activity>
+        <!-- Pin Flutter's Impeller renderer to its OpenGLES backend.
+             User reports cluster on Android 10 devices whose legacy Vulkan
+             drivers freeze the MapLibre platform view (map stops responding
+             to pan/zoom) since the Flutter 3.44 upgrade made Impeller pick
+             Vulkan by default. The GLES path is verified to keep the map
+             fully interactive (API 29 and API 35). Remove once the affected
+             driver generation ages out or Flutter blocklists it. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.ImpellerBackend"
+            android:value="opengles" />
+        <!-- Required by the pasteboard plugin ("Copy QR" in the operator QR
+             dialog): on Android it writes the PNG to cacheDir and shares it
+             through a FileProvider with authority ${applicationId}.provider.
+             Without this declaration the copy fails with a PlatformException
+             ("Couldn't find meta-data for provider..."). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths" />
+        </provider>
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>
