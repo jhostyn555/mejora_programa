@@ -44,4 +44,7 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Variables de entorno (no subir a control de versiones)
+.env
+
 .vs/

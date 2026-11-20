@@ -105,6 +105,11 @@ dependencies:
   maplibre_gl: ^0.26.2
   supabase_flutter: ^2.18.3
 
+  # Cloudinary: subida de imágenes (multipart/form-data) y selección de fotos
+  http: ^1.2.2
+  image_picker: ^1.1.2
+  flutter_dotenv: ^5.1.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
